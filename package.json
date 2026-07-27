@@ -1,0 +1,15 @@
+{
+  "name": "chronosense",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:": "node scripts/run-dev-service.mjs",
+    "dev": "sh -c 'npm run dev:backend & npm run dev:frontend & wait'",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "sh -c 'mkdir -p logs; if [ ! -x frontend/react/node_modules/.bin/vite ]; then npm --prefix frontend/react install; fi; npm --prefix frontend/react run dev 2>&1 | tee -a logs/frontend.log'",
+    "dev:attendance": "npm run dev: -- attendance",
+    "dev:emotion": "npm run dev: -- emotion",
+    "dev:activity": "npm run dev: -- activity",
+    "build": "npm --prefix frontend/react run build"
+  }
+}

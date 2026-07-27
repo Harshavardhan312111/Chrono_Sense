@@ -1,0 +1,6 @@
+face_snapshots/
+frontend/react/node_modules/
+frontend/react/dist/
+.env
+frontend/react/.env.local
+frontend/react/certs/

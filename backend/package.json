@@ -1,0 +1,10 @@
+{
+  "name": "chronosense-backend",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "sh -c 'npm run dev:backend:api & npm run dev:backend:worker & wait'",
+    "dev:backend:api": "cd .. && sh -c 'if [ ! -x ./.venv/bin/python ]; then python3 -m venv .venv; fi; if ! ./.venv/bin/python -c \"import pymongo\" >/dev/null 2>&1; then ./.venv/bin/pip install -r requirements.txt; fi; PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/uvicorn --app-dir backend server:app --host 0.0.0.0 --port 8000 --reload'",
+    "dev:backend:worker": "cd .. && sh -c 'if [ ! -x ./.venv/bin/python ]; then python3 -m venv .venv; fi; if ! ./.venv/bin/python -c \"import pymongo\" >/dev/null 2>&1; then ./.venv/bin/pip install -r requirements.txt; fi; PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python backend/recognition_worker.py'"
+  }
+}

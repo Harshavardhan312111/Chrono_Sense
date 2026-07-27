@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ChronoSense Shell</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f1e7;
+        --panel: rgba(255, 251, 245, 0.98);
+        --line: rgba(170, 140, 90, 0.18);
+        --text: #31261a;
+        --muted: #6f6254;
+        --accent: #0f766e;
+        --accent-2: #d97706;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(15, 118, 110, 0.08), transparent 35%),
+          linear-gradient(160deg, #f5efe6 0%, #fdf8f1 55%, #efe5d7 100%);
+        color: var(--text);
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+
+      .panel {
+        width: min(720px, 100%);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        padding: 32px;
+        box-shadow: 0 18px 48px rgba(105, 79, 40, 0.12);
+        backdrop-filter: blur(16px);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(2rem, 5vw, 3rem);
+      }
+
+      p {
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      code {
+        color: var(--accent);
+      }
+
+      .steps {
+        margin: 24px 0;
+        padding-left: 20px;
+      }
+
+      .steps li {
+        margin: 12px 0;
+        color: var(--text);
+      }
+
+      .note {
+        border-left: 3px solid var(--accent-2);
+        padding-left: 16px;
+        margin-top: 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="panel">
+      <h1>ChronoSense shell is ready</h1>
+      <p>
+        The source lives in <code>frontend/react/</code>, but the production bundle
+        has not been built yet.
+      </p>
+      <ol class="steps">
+        <li>Open <code>frontend/react/</code></li>
+        <li>Run <code>npm install</code></li>
+        <li>Run <code>npm run dev</code> for local UI work or <code>npm run build</code> for FastAPI serving</li>
+      </ol>
+      <p class="note">
+        FastAPI now expects the React build to be the frontend surface, so build this bundle before using the app.
+      </p>
+    </main>
+  </body>
+  </html>
