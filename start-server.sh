@@ -6,6 +6,13 @@
 PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$PROJECT_DIR"
 
+if [ -f ".env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
 echo "======================================"
 echo "ChronoSenseWeb Server Startup"
 echo "======================================"
@@ -34,6 +41,11 @@ source .venv/bin/activate
 echo "📥 Installing dependencies..."
 pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
+
+if [ ! -s "backend/models/emotion-ferplus-8.onnx" ]; then
+    echo "FERPlus model is missing. Run ./scripts/setup/install.sh first." >&2
+    exit 1
+fi
 
 if [ -z "${MONGO_URI}" ]; then
     echo "⚠️  MONGO_URI is not set. Create .env or export MongoDB settings before startup."
