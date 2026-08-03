@@ -1,8 +1,11 @@
 import os
-from datetime import datetime
 
 from dotenv import load_dotenv
 import numpy as np
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 load_dotenv()
 
@@ -71,9 +74,9 @@ class MongoStore:
         result = self.collection("counters").find_one_and_update(
             {"_id": sequence_name},
             {
-                "$setOnInsert": {"created_at": datetime.utcnow()},
+                "$setOnInsert": {"created_at": app_now()},
                 "$inc": {"value": 1},
-                "$set": {"updated_at": datetime.utcnow()},
+                "$set": {"updated_at": app_now()},
             },
             upsert=True,
             return_document=ReturnDocument.AFTER,
@@ -129,6 +132,13 @@ class MongoStore:
             [("camera_id", ASCENDING), ("timestamp", ASCENDING)]
         )
         self.collection("unknown_faces").create_index([("camera_id", ASCENDING), ("last_seen", ASCENDING)])
+        self.collection("recognition_review").create_index(
+            [("camera_id", ASCENDING), ("predicted_profile_id", ASCENDING)],
+            unique=True,
+        )
+        self.collection("recognition_review").create_index([("camera_id", ASCENDING), ("top1_score", ASCENDING)])
+        self.collection("recognition_review").create_index([("review_status", ASCENDING), ("top1_score", ASCENDING)])
+        self.collection("recognition_review").create_index("updated_at", expireAfterSeconds=86400)
         self.collection("camera_logs").create_index([("camera_id", ASCENDING), ("timestamp", ASCENDING)])
         self.collection("attendance_summary").create_index(
             [("profile_id", ASCENDING), ("date", ASCENDING)], unique=True

@@ -10,6 +10,7 @@ import insightface
 import time
 import os
 import threading
+import math
 from collections import defaultdict, deque
 from filterpy.kalman import KalmanFilter
 import logging
@@ -28,6 +29,144 @@ def _required_gap_for_score(best_score):
     return 0.10
 
 
+def _format_top_scores(all_scores, limit=3):
+    ranked_scores = sorted(
+        (
+            (name, float((score_data or {}).get("score") or 0.0))
+            for name, score_data in (all_scores or {}).items()
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:limit]
+    return ", ".join(f"{name}={score:.4f}" for name, score in ranked_scores) or "none"
+
+
+def _top_score_candidates(all_scores, limit=3):
+    ranked_scores = sorted(
+        (
+            {
+                "name": name,
+                "score": round(float((score_data or {}).get("score") or 0.0), 4),
+                "matched_view": (score_data or {}).get("matched_view"),
+            }
+            for name, score_data in (all_scores or {}).items()
+        ),
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    return ranked_scores[:limit]
+
+
+class RecognitionQualityAssessor:
+    """Estimate whether a detected face crop is strong enough for identity recovery."""
+
+    def __init__(self):
+        self.min_face_size_identity = max(20, int(os.getenv("CHRONOSENSE_MIN_FACE_SIZE_IDENTITY", "36")))
+        self.usable_face_size_identity = max(
+            self.min_face_size_identity,
+            int(os.getenv("CHRONOSENSE_USABLE_FACE_SIZE_IDENTITY", "64")),
+        )
+
+    def assess(self, frame, bbox, landmarks=None, detection_confidence=1.0):
+        x, y, w, h = [int(value) for value in bbox]
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(frame.shape[1], x + w)
+        y2 = min(frame.shape[0], y + h)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return {
+                "quality_score": 0.0,
+                "quality_band": "too_small",
+                "face_size_px": 0,
+                "blur_score": 0.0,
+                "brightness": 0.0,
+                "contrast": 0.0,
+                "yaw": 0.0,
+                "pitch": 0.0,
+                "roll": 0.0,
+                "occlusion_risk": 1.0,
+                "detection_confidence": round(float(detection_confidence or 0.0), 4),
+            }
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        face_size = int(min(crop.shape[:2]))
+        blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        brightness = float(np.mean(gray) / 255.0)
+        contrast = float(np.std(gray) / 64.0)
+        pose = self._estimate_pose(landmarks, crop.shape[1], crop.shape[0])
+        occlusion_risk = self._estimate_occlusion(gray)
+
+        size_score = min(1.0, face_size / float(max(self.usable_face_size_identity, 1)))
+        blur_norm = min(1.0, blur_score / 160.0)
+        contrast_norm = min(1.0, contrast)
+        brightness_score = max(0.0, 1.0 - abs(brightness - 0.55) / 0.55)
+        pose_penalty = min(1.0, (abs(pose["yaw"]) + abs(pose["pitch"]) + abs(pose["roll"])) / 120.0)
+        detection_norm = max(0.0, min(1.0, float(detection_confidence or 0.0)))
+        quality_score = (
+            (size_score * 0.30)
+            + (blur_norm * 0.18)
+            + (contrast_norm * 0.14)
+            + (brightness_score * 0.12)
+            + ((1.0 - occlusion_risk) * 0.16)
+            + ((1.0 - pose_penalty) * 0.06)
+            + (detection_norm * 0.04)
+        )
+        quality_score = round(max(0.0, min(1.0, quality_score)), 4)
+
+        if face_size < self.min_face_size_identity:
+            quality_band = "too_small"
+        elif quality_score >= 0.55 and face_size >= self.usable_face_size_identity:
+            quality_band = "usable"
+        else:
+            quality_band = "weak"
+
+        return {
+            "quality_score": quality_score,
+            "quality_band": quality_band,
+            "face_size_px": face_size,
+            "blur_score": round(blur_score, 4),
+            "brightness": round(brightness, 4),
+            "contrast": round(contrast_norm, 4),
+            "yaw": round(pose["yaw"], 4),
+            "pitch": round(pose["pitch"], 4),
+            "roll": round(pose["roll"], 4),
+            "occlusion_risk": round(occlusion_risk, 4),
+            "detection_confidence": round(detection_norm, 4),
+        }
+
+    @staticmethod
+    def _estimate_pose(landmarks, width, height):
+        if landmarks is None or len(landmarks) < 68:
+            return {"yaw": 0.0, "pitch": 0.0, "roll": 0.0}
+        try:
+            points = np.asarray(landmarks)
+            left_eye = np.mean(points[36:42], axis=0)
+            right_eye = np.mean(points[42:48], axis=0)
+            nose = points[30]
+            mouth_left = points[48]
+            mouth_right = points[54]
+            eye_dx = max(1e-6, right_eye[0] - left_eye[0])
+            eye_dy = right_eye[1] - left_eye[1]
+            eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
+            yaw = ((nose[0] - eye_center_x) / max(width, 1)) * 90.0
+            pitch = (((mouth_left[1] + mouth_right[1]) / 2.0) - nose[1]) / max(height, 1) * 90.0
+            roll = math.degrees(math.atan2(eye_dy, eye_dx))
+            return {"yaw": yaw, "pitch": pitch, "roll": roll}
+        except Exception:
+            return {"yaw": 0.0, "pitch": 0.0, "roll": 0.0}
+
+    @staticmethod
+    def _estimate_occlusion(gray_face):
+        height, width = gray_face.shape[:2]
+        center_patch = gray_face[height // 4 : (3 * height) // 4, width // 4 : (3 * width) // 4]
+        if center_patch.size == 0:
+            return 1.0
+        contrast = np.std(center_patch) / 64.0
+        shadow_penalty = 1.0 - min(1.0, np.mean(center_patch) / 255.0)
+        return max(0.0, min(1.0, (shadow_penalty * 0.6) + (max(0.0, 1.0 - contrast) * 0.4)))
+
+
 class InsightFaceRecognizer:
     """
     Production-grade face recognition using InsightFace ArcFace v2.
@@ -38,6 +177,7 @@ class InsightFaceRecognizer:
     def __init__(self):
         """Initialize InsightFace model and GPU acceleration"""
         self._lock = threading.Lock()
+        self.quality_assessor = RecognitionQualityAssessor()
         try:
             self.app = insightface.app.FaceAnalysis(
                 name='buffalo_l',  # Lightweight model optimized for speed
@@ -79,88 +219,104 @@ class InsightFaceRecognizer:
 
         return min(faces, key=score)
     
-    def get_embedding(self, frame, bbox):
-        """
-        Extract face embedding from frame ROI.
-        Args:
-            frame: BGR image
-            bbox: (x, y, w, h) bounding box
-        Returns:
-            512-D numpy array (normalized)
-        """
-        x, y, w, h = bbox
-        
-        # First try: use full frame
-        try:
-            faces = self.get_faces_safe(frame)
-            best_face = self._select_best_face(faces, bbox)
-            if best_face is not None:
-                emb = best_face.embedding.astype(np.float32)
-                logger.debug(f"Extracted embedding from full frame: shape={emb.shape}, dtype={emb.dtype}, norm={np.linalg.norm(emb):.4f}")
-                return emb
-        except Exception as e:
-            logger.debug(f"Direct frame detection failed: {e}")
-        
-        # Fallback: extract ROI with generous padding and try again
+    def _build_preprocessed_variants(self, frame, bbox):
+        x, y, w, h = [int(value) for value in bbox]
         pad = int(max(w, h) * 0.5)
         x1, y1 = max(0, x - pad), max(0, y - pad)
         x2, y2 = min(frame.shape[1], x + w + pad), min(frame.shape[0], y + h + pad)
         face_roi = frame[y1:y2, x1:x2]
-        
+        variants = [("full_frame", frame, bbox, "baseline")]
         if face_roi.size == 0:
-            logger.warning(f"Empty ROI for bbox {bbox}")
-            return None
-        
-        try:
-            faces = self.get_faces_safe(face_roi)
-            best_face = self._select_best_face(faces)
-            if best_face is not None:
-                emb = best_face.embedding.astype(np.float32)
-                logger.debug(f"Extracted embedding from ROI: shape={emb.shape}, dtype={emb.dtype}, norm={np.linalg.norm(emb):.4f}")
-                return emb
-        except Exception as e:
-            logger.debug(f"ROI detection failed: {e}")
-        
-        # Last resort: upscale ROI so small faces become detectable
-        try:
-            rh, rw = face_roi.shape[:2]
-            target = 500
-            scale_up = max(target / rw, target / rh)
-            if scale_up > 1.2:
-                upscaled = cv2.resize(face_roi, None, fx=scale_up, fy=scale_up, interpolation=cv2.INTER_CUBIC)
-                faces = self.get_faces_safe(upscaled)
-                best_face = self._select_best_face(faces)
-                if best_face is not None:
-                    emb = best_face.embedding.astype(np.float32)
-                    logger.info(f"Extracted embedding from upscaled ROI ({scale_up:.1f}x): shape={emb.shape}, norm={np.linalg.norm(emb):.4f}")
-                    return emb
-        except Exception as e:
-            logger.debug(f"Upscaled ROI detection failed: {e}")
+            return variants
 
-        # Final fallback: upscale the full frame so small faces become more detectable.
+        variants.append(("roi", face_roi, None, "roi_crop"))
+
         try:
-            fh, fw = frame.shape[:2]
-            target = 1600
-            scale_up = min(4.0, max(target / max(fw, 1), target / max(fh, 1)))
-            if scale_up > 1.2:
-                upscaled_frame = cv2.resize(frame, None, fx=scale_up, fy=scale_up, interpolation=cv2.INTER_CUBIC)
-                scaled_bbox = (
-                    int(x * scale_up),
-                    int(y * scale_up),
-                    int(w * scale_up),
-                    int(h * scale_up)
-                )
-                faces = self.get_faces_safe(upscaled_frame)
-                best_face = self._select_best_face(faces, scaled_bbox)
-                if best_face is not None:
-                    emb = best_face.embedding.astype(np.float32)
-                    logger.info(f"Extracted embedding from upscaled full frame ({scale_up:.1f}x): shape={emb.shape}, norm={np.linalg.norm(emb):.4f}")
-                    return emb
-        except Exception as e:
-            logger.debug(f"Upscaled full-frame detection failed: {e}")
-        
-        logger.warning(f"Failed to extract embedding for bbox {bbox}")
-        return None
+            normalized = face_roi.copy()
+            lab = cv2.cvtColor(normalized, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            l_channel = clahe.apply(l_channel)
+            normalized = cv2.merge((l_channel, a_channel, b_channel))
+            normalized = cv2.cvtColor(normalized, cv2.COLOR_LAB2BGR)
+            variants.append(("roi_normalized", normalized, None, "contrast_normalized"))
+
+            denoised = cv2.fastNlMeansDenoisingColored(normalized, None, 5, 5, 7, 21)
+            variants.append(("roi_denoised", denoised, None, "denoise"))
+
+            sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+            sharpened = cv2.filter2D(denoised, -1, sharpen_kernel)
+            variants.append(("roi_sharpened", sharpened, None, "sharpen"))
+
+            rh, rw = face_roi.shape[:2]
+            if rh > 0 and rw > 0:
+                target = 500
+                scale_up = max(target / rw, target / rh)
+                if scale_up > 1.2:
+                    upscaled = cv2.resize(sharpened, None, fx=scale_up, fy=scale_up, interpolation=cv2.INTER_CUBIC)
+                    variants.append(("roi_upscaled", upscaled, None, "upscale"))
+        except Exception as exc:
+            logger.debug(f"Failed to build recognition preprocess variants: {exc}")
+        return variants
+
+    def get_embedding_with_diagnostics(self, frame, bbox):
+        """
+        Extract the best available face embedding and explain which recovery path won.
+        """
+        best = {
+            "embedding": None,
+            "variant": None,
+            "recovery_stage": "failed",
+            "det_score": 0.0,
+            "input_face_size": int(min(bbox[2], bbox[3])) if len(bbox) >= 4 else 0,
+        }
+
+        for variant_name, variant_frame, target_bbox, recovery_stage in self._build_preprocessed_variants(frame, bbox):
+            try:
+                faces = self.get_faces_safe(variant_frame)
+                best_face = self._select_best_face(faces, target_bbox)
+                if best_face is None:
+                    continue
+                det_score = float(getattr(best_face, "det_score", 0.0) or 0.0)
+                if det_score >= best["det_score"] or best["embedding"] is None:
+                    best = {
+                        "embedding": best_face.embedding.astype(np.float32),
+                        "variant": variant_name,
+                        "recovery_stage": recovery_stage,
+                        "det_score": det_score,
+                        "input_face_size": int(min(variant_frame.shape[:2])),
+                    }
+            except Exception as exc:
+                logger.debug(f"Embedding extraction failed for variant {variant_name}: {exc}")
+
+        if best["embedding"] is None:
+            x, y, w, h = bbox
+            try:
+                fh, fw = frame.shape[:2]
+                target = 1600
+                scale_up = min(4.0, max(target / max(fw, 1), target / max(fh, 1)))
+                if scale_up > 1.2:
+                    upscaled_frame = cv2.resize(frame, None, fx=scale_up, fy=scale_up, interpolation=cv2.INTER_CUBIC)
+                    scaled_bbox = (int(x * scale_up), int(y * scale_up), int(w * scale_up), int(h * scale_up))
+                    faces = self.get_faces_safe(upscaled_frame)
+                    best_face = self._select_best_face(faces, scaled_bbox)
+                    if best_face is not None:
+                        best = {
+                            "embedding": best_face.embedding.astype(np.float32),
+                            "variant": "full_frame_upscaled",
+                            "recovery_stage": "full_frame_upscale",
+                            "det_score": float(getattr(best_face, "det_score", 0.0) or 0.0),
+                            "input_face_size": int(min(scaled_bbox[2], scaled_bbox[3])),
+                        }
+            except Exception as exc:
+                logger.debug(f"Upscaled full-frame detection failed: {exc}")
+
+        if best["embedding"] is None:
+            logger.warning(f"Failed to extract embedding for bbox {bbox}")
+        return best
+
+    def get_embedding(self, frame, bbox):
+        return self.get_embedding_with_diagnostics(frame, bbox).get("embedding")
     
     @staticmethod
     def cosine_similarity(emb1, emb2):
@@ -396,6 +552,10 @@ class ChronoEngine:
         
         self.recognition_threshold = recognition_threshold
         self.matching_metric = matching_metric
+        self.quality_assessor = self.recognizer.quality_assessor
+        self.weak_match_threshold = float(
+            os.getenv("CHRONOSENSE_WEAK_MATCH_THRESHOLD", str(max(0.24, recognition_threshold - 0.06)))
+        )
         
         # Camera-specific thresholds for handling different image qualities
         # Local Webcam captures at different angle/lighting than IP cameras
@@ -419,7 +579,8 @@ class ChronoEngine:
             f"✓ ChronoEngine initialized (threshold={recognition_threshold}, metric={matching_metric}, "
             f"camera_thresholds={list(self.camera_thresholds.keys())}, classroom_mode=60_faces, "
             f"emotion_detection={'on' if self.enable_emotion_detection else 'off'}, "
-            f"dynamic_gap={'on' if self.dynamic_gap_enabled else 'off'})"
+            f"dynamic_gap={'on' if self.dynamic_gap_enabled else 'off'}, "
+            f"weak_match_threshold={self.weak_match_threshold:.2f})"
         )
     
     def detect_faces(self, frame):
@@ -551,6 +712,24 @@ class ChronoEngine:
                 "recognition_rejection_reason": "no_profiles_loaded",
             }
         
+        detection_confidence = 1.0
+        if face_obj is not None:
+            detection_confidence = float(getattr(face_obj, "det_score", 1.0) or 1.0)
+        recognition_quality = self.quality_assessor.assess(
+            frame,
+            bbox,
+            landmarks=getattr(face_obj, "landmark", None) if face_obj is not None else None,
+            detection_confidence=detection_confidence,
+        )
+
+        embedding_diagnostics = {
+            "variant": "face_obj",
+            "recovery_stage": "baseline",
+            "det_score": detection_confidence,
+            "input_face_size": recognition_quality.get("face_size_px", 0),
+        }
+        enhancement_forced = recognition_quality.get("quality_band") in {"weak", "too_small"}
+
         # Use pre-computed embedding from face_obj if available (already computed by InsightFace detector)
         if face_obj is not None:
             try:
@@ -560,8 +739,27 @@ class ChronoEngine:
                 logger.warning(f"Failed to extract embedding from face_obj: {e}")
                 embedding = None
         else:
-            embedding = self.recognizer.get_embedding(frame, bbox)
+            embedding = None
         
+        enhanced_embedding = None
+        enhanced_embedding_diagnostics = None
+        if embedding is None or enhancement_forced:
+            embedding_result = self.recognizer.get_embedding_with_diagnostics(frame, bbox)
+            if embedding is None:
+                embedding = embedding_result.get("embedding")
+                embedding_diagnostics.update(embedding_result)
+            else:
+                enhanced_embedding = embedding_result.get("embedding")
+                enhanced_embedding_diagnostics = embedding_result
+                if enhanced_embedding is not None:
+                    logger.info(
+                        "Enhancer engaged for quality_band=%s face_size=%spx via %s/%s",
+                        recognition_quality.get("quality_band"),
+                        recognition_quality.get("face_size_px"),
+                        enhanced_embedding_diagnostics.get("variant"),
+                        enhanced_embedding_diagnostics.get("recovery_stage"),
+                    )
+
         if embedding is None:
             logger.info(f"Failed to extract embedding for bbox {bbox}")
             return None, 'Unknown', 0.0, {
@@ -572,57 +770,94 @@ class ChronoEngine:
                 "applied_min_gap": 0.10,
                 "matched_view": None,
                 "recognition_rejection_reason": "embedding_extraction_failed",
+                "quality_score": recognition_quality.get("quality_score", 0.0),
+                "quality_band": recognition_quality.get("quality_band"),
+                "face_size_px": recognition_quality.get("face_size_px", 0),
+                "blur_score": recognition_quality.get("blur_score", 0.0),
+                "brightness": recognition_quality.get("brightness", 0.0),
+                "contrast": recognition_quality.get("contrast", 0.0),
+                "yaw": recognition_quality.get("yaw", 0.0),
+                "pitch": recognition_quality.get("pitch", 0.0),
+                "roll": recognition_quality.get("roll", 0.0),
+                "occlusion_risk": recognition_quality.get("occlusion_risk", 0.0),
+                "preprocess_variant": embedding_diagnostics.get("variant"),
+                "recovery_stage": embedding_diagnostics.get("recovery_stage", "failed"),
+                "decision_reason": "embedding_extraction_failed",
             }
         
-        best_match = None
-        best_score = 0.0
-        second_best_score = 0.0
-        all_scores = {}
-        
-        for profile_id, profile in self.profiles.items():
-            profile_best_score = 0.0
-            matched_view = "legacy"
-            candidate_embeddings = []
+        def _score_embedding(candidate_embedding_vector):
+            local_best_match = None
+            local_best_score = 0.0
+            local_second_best_score = 0.0
+            local_scores = {}
 
-            for view_name, view_payload in (profile.get("view_embeddings") or {}).items():
-                candidate_embedding = view_payload.get("embedding")
-                if candidate_embedding is None:
+            for profile_id, profile in self.profiles.items():
+                profile_best_score = 0.0
+                matched_view = "legacy"
+                candidate_embeddings = []
+
+                for view_name, view_payload in (profile.get("view_embeddings") or {}).items():
+                    candidate_embedding = view_payload.get("embedding")
+                    if candidate_embedding is None:
+                        continue
+                    candidate_embeddings.append((view_name, candidate_embedding))
+
+                if not candidate_embeddings and profile.get("embedding") is not None:
+                    candidate_embeddings.append(("legacy", profile["embedding"]))
+
+                for view_name, candidate_embedding in candidate_embeddings:
+                    if self.matching_metric == 'cosine':
+                        score = self.recognizer.cosine_similarity(candidate_embedding_vector, candidate_embedding)
+                    elif self.matching_metric == 'euclidean':
+                        score = self.recognizer.euclidean_distance(candidate_embedding_vector, candidate_embedding)
+                    elif self.matching_metric == 'manhattan':
+                        score = self.recognizer.manhattan_distance(candidate_embedding_vector, candidate_embedding)
+                    else:
+                        score = self.recognizer.hybrid_similarity(candidate_embedding_vector, candidate_embedding)
+
+                    if score > profile_best_score:
+                        profile_best_score = score
+                        matched_view = view_name
+
+                if not candidate_embeddings:
                     continue
-                candidate_embeddings.append((view_name, candidate_embedding))
 
-            if not candidate_embeddings and profile.get("embedding") is not None:
-                candidate_embeddings.append(("legacy", profile["embedding"]))
+                local_scores[profile['name']] = {
+                    "score": profile_best_score,
+                    "matched_view": matched_view,
+                }
+                if profile_best_score > local_best_score:
+                    local_second_best_score = local_best_score
+                    local_best_score = profile_best_score
+                    local_best_match = profile_id
+                elif profile_best_score > local_second_best_score:
+                    local_second_best_score = profile_best_score
 
-            for view_name, candidate_embedding in candidate_embeddings:
-                if self.matching_metric == 'cosine':
-                    score = self.recognizer.cosine_similarity(embedding, candidate_embedding)
-                elif self.matching_metric == 'euclidean':
-                    score = self.recognizer.euclidean_distance(embedding, candidate_embedding)
-                elif self.matching_metric == 'manhattan':
-                    score = self.recognizer.manhattan_distance(embedding, candidate_embedding)
-                else:  # 'hybrid' (default)
-                    score = self.recognizer.hybrid_similarity(embedding, candidate_embedding)
+            return local_best_match, local_best_score, local_second_best_score, local_scores
 
-                if score > profile_best_score:
-                    profile_best_score = score
-                    matched_view = view_name
-
-            if not candidate_embeddings:
-                continue
-
-            all_scores[profile['name']] = {
-                "score": profile_best_score,
-                "matched_view": matched_view,
-            }
-            if profile_best_score > best_score:
-                second_best_score = best_score
-                best_score = profile_best_score
-                best_match = profile_id
-            elif profile_best_score > second_best_score:
-                second_best_score = profile_best_score
-        
-        # Log all scores for debugging
-        logger.info(f"=== FACE RECOGNITION SCORES === Profiles: {all_scores}")
+        best_match, best_score, second_best_score, all_scores = _score_embedding(embedding)
+        if enhanced_embedding is not None:
+            enhanced_best_match, enhanced_best_score, enhanced_second_best_score, enhanced_scores = _score_embedding(enhanced_embedding)
+            if enhanced_best_score > best_score:
+                logger.info(
+                    "Enhancer improved match: %.4f -> %.4f using %s/%s",
+                    float(best_score or 0.0),
+                    float(enhanced_best_score or 0.0),
+                    enhanced_embedding_diagnostics.get("variant"),
+                    enhanced_embedding_diagnostics.get("recovery_stage"),
+                )
+                embedding = enhanced_embedding
+                embedding_diagnostics.update(enhanced_embedding_diagnostics or {})
+                best_match = enhanced_best_match
+                best_score = enhanced_best_score
+                second_best_score = enhanced_second_best_score
+                all_scores = enhanced_scores
+            else:
+                logger.info(
+                    "Enhancer evaluated but baseline won: baseline=%.4f enhanced=%.4f",
+                    float(best_score or 0.0),
+                    float(enhanced_best_score or 0.0),
+                )
         
         # Use camera-specific threshold if available, otherwise use default
         # This allows lower thresholds for lower-quality cameras (e.g., webcam)
@@ -631,6 +866,8 @@ class ChronoEngine:
             logger.info(f"🎥 Using camera-specific threshold: {threshold:.3f} for '{camera_id}'")
         else:
             threshold = self.recognition_threshold
+
+        weak_threshold = min(threshold, self.weak_match_threshold)
         
         score_gap = best_score - second_best_score
         
@@ -641,33 +878,75 @@ class ChronoEngine:
         matched_view = self.profiles[best_match].get("matched_view") if best_match else None
         if best_match:
             matched_view = all_scores.get(best_name, {}).get("matched_view")
+        top_candidates = _top_score_candidates(all_scores, limit=3)
         recognition_debug = {
+            "predicted_profile_id": best_match,
+            "predicted_name": best_name if best_match is not None else None,
             "best_score": round(float(best_score or 0.0), 4),
             "second_best_score": round(float(second_best_score or 0.0), 4),
             "score_gap": round(float(score_gap or 0.0), 4),
             "applied_threshold": round(float(threshold or 0.0), 4),
+            "weak_match_threshold": round(float(weak_threshold or 0.0), 4),
             "applied_min_gap": round(float(min_gap or 0.0), 4),
             "matched_view": matched_view,
+            "top_candidates": top_candidates,
             "recognition_rejection_reason": None,
+            "quality_score": recognition_quality.get("quality_score", 0.0),
+            "quality_band": recognition_quality.get("quality_band"),
+            "face_size_px": recognition_quality.get("face_size_px", 0),
+            "blur_score": recognition_quality.get("blur_score", 0.0),
+            "brightness": recognition_quality.get("brightness", 0.0),
+            "contrast": recognition_quality.get("contrast", 0.0),
+            "yaw": recognition_quality.get("yaw", 0.0),
+            "pitch": recognition_quality.get("pitch", 0.0),
+            "roll": recognition_quality.get("roll", 0.0),
+            "occlusion_risk": recognition_quality.get("occlusion_risk", 0.0),
+            "preprocess_variant": embedding_diagnostics.get("variant"),
+            "recovery_stage": embedding_diagnostics.get("recovery_stage", "baseline"),
+            "embedding_det_score": round(float(embedding_diagnostics.get("det_score") or 0.0), 4),
+            "decision_reason": None,
         }
-        logger.info(f"Best: {best_name}={best_score:.4f}, 2nd={second_best_score:.4f}, gap={score_gap:.4f}, threshold={threshold:.4f}, min_gap={min_gap:.4f}")
-        
+        top_scores_summary = _format_top_scores(all_scores, limit=3)
+
         # Match only if BOTH conditions are met:
         # 1. Score >= threshold (absolute quality check)
         # 2. Gap >= min_gap (relative distinctiveness check - not confused with another person)
         if best_score >= threshold and score_gap >= min_gap and best_match is not None:
-            logger.info(f"✓ RECOGNIZED: {best_name} (score={best_score:.4f}, gap={score_gap:.4f}, matched_view={matched_view})")
+            recognition_debug["decision_reason"] = (
+                "identity_weak_but_recovered"
+                if recognition_quality.get("quality_band") == "weak" or embedding_diagnostics.get("recovery_stage") != "baseline"
+                else "identity_accepted"
+            )
+            logger.info(
+                "RECOGNIZED: name=%s threshold=%.4f top3=[%s]",
+                best_name,
+                float(threshold or 0.0),
+                top_scores_summary,
+            )
             return best_match, self.profiles[best_match]['name'], best_score, recognition_debug
         
         if best_score < threshold:
-            logger.warning(f"✗ NOT RECOGNIZED: Best score {best_score:.4f} < threshold {threshold:.4f}")
+            logger.warning(
+                "NOT_RECOGNIZED: threshold=%.4f top3=[%s]",
+                float(threshold or 0.0),
+                top_scores_summary,
+            )
             recognition_debug["recognition_rejection_reason"] = "threshold"
+            recognition_debug["decision_reason"] = (
+                "face_too_small_for_identity" if recognition_quality.get("quality_band") == "too_small" else "below_match_threshold"
+            )
         elif score_gap < min_gap:
-            logger.warning(f"✗ NOT RECOGNIZED: Score gap {score_gap:.4f} < min_gap {min_gap:.4f} (ambiguous: {best_name}={best_score:.4f} vs 2nd={second_best_score:.4f})")
+            logger.warning(
+                "NOT_RECOGNIZED: threshold=%.4f top3=[%s]",
+                float(threshold or 0.0),
+                top_scores_summary,
+            )
             recognition_debug["recognition_rejection_reason"] = "gap"
+            recognition_debug["decision_reason"] = "ambiguous_match_gap"
         else:
             recognition_debug["recognition_rejection_reason"] = "unknown"
-        
+            recognition_debug["decision_reason"] = "unresolved_identity"
+
         return None, 'Unknown', best_score, recognition_debug
     
     def match_detections_to_tracks(self, detections, frame):

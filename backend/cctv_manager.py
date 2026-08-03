@@ -1,11 +1,14 @@
 import logging
-from datetime import datetime
 from typing import Dict, List, Tuple
 
 try:
     from mongo_store import mongo_store
 except ImportError:
     from backend.mongo_store import mongo_store
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,10 @@ class CCTVCamera:
         inference_width: int = 960,
         target_fps: float = 8.0,
         recognition_threshold_override: float = None,
+        min_face_size_identity: int = None,
+        min_face_size_emotion: int = None,
+        weak_match_threshold: float = None,
+        consensus_frames_required: int = None,
         enable_emotion: bool = None,
         enable_activity: bool = None,
         wing: str = None,
@@ -47,6 +54,10 @@ class CCTVCamera:
         self.inference_width = inference_width
         self.target_fps = target_fps
         self.recognition_threshold_override = recognition_threshold_override
+        self.min_face_size_identity = min_face_size_identity
+        self.min_face_size_emotion = min_face_size_emotion
+        self.weak_match_threshold = weak_match_threshold
+        self.consensus_frames_required = consensus_frames_required
         self.enable_emotion = enable_emotion
         self.enable_activity = enable_activity
         self.wing = wing
@@ -79,6 +90,10 @@ class CCTVManager:
         inference_width: int = 960,
         target_fps: float = 8.0,
         recognition_threshold_override: float = None,
+        min_face_size_identity: int = None,
+        min_face_size_emotion: int = None,
+        weak_match_threshold: float = None,
+        consensus_frames_required: int = None,
         enable_emotion: bool = None,
         enable_activity: bool = None,
         wing: str = None,
@@ -107,6 +122,10 @@ class CCTVManager:
                     "inference_width": inference_width,
                     "target_fps": target_fps,
                     "recognition_threshold_override": recognition_threshold_override,
+                    "min_face_size_identity": min_face_size_identity,
+                    "min_face_size_emotion": min_face_size_emotion,
+                    "weak_match_threshold": weak_match_threshold,
+                    "consensus_frames_required": consensus_frames_required,
                     "enable_emotion": enable_emotion,
                     "enable_activity": enable_activity,
                     "wing": wing,
@@ -119,8 +138,9 @@ class CCTVManager:
                     "student_seating_zone": student_seating_zone,
                     "faculty_workstation_zone": faculty_workstation_zone,
                     "enabled": True,
-                    "created_at": datetime.utcnow(),
-                    "last_modified": datetime.utcnow(),
+                    "processing_enabled": True,
+                    "created_at": app_now(),
+                    "last_modified": app_now(),
                 }
             )
             return camera_id
@@ -146,6 +166,10 @@ class CCTVManager:
                         "inference_width": int(doc.get("inference_width", 960) or 960),
                         "target_fps": float(doc.get("target_fps", 8.0) or 8.0),
                         "recognition_threshold_override": doc.get("recognition_threshold_override"),
+                        "min_face_size_identity": doc.get("min_face_size_identity"),
+                        "min_face_size_emotion": doc.get("min_face_size_emotion"),
+                        "weak_match_threshold": doc.get("weak_match_threshold"),
+                        "consensus_frames_required": doc.get("consensus_frames_required"),
                         "enable_emotion": doc.get("enable_emotion"),
                         "enable_activity": doc.get("enable_activity"),
                         "wing": doc.get("wing"),
@@ -158,6 +182,7 @@ class CCTVManager:
                         "student_seating_zone": doc.get("student_seating_zone"),
                         "faculty_workstation_zone": doc.get("faculty_workstation_zone"),
                         "enabled": bool(doc.get("enabled", True)),
+                        "processing_enabled": bool(doc.get("processing_enabled", True)),
                     }
                 )
             return cameras
@@ -178,6 +203,10 @@ class CCTVManager:
         inference_width: int = 960,
         target_fps: float = 8.0,
         recognition_threshold_override: float = None,
+        min_face_size_identity: int = None,
+        min_face_size_emotion: int = None,
+        weak_match_threshold: float = None,
+        consensus_frames_required: int = None,
         enable_emotion: bool = None,
         enable_activity: bool = None,
         wing: str = None,
@@ -206,6 +235,10 @@ class CCTVManager:
                         "inference_width": inference_width,
                         "target_fps": target_fps,
                         "recognition_threshold_override": recognition_threshold_override,
+                        "min_face_size_identity": min_face_size_identity,
+                        "min_face_size_emotion": min_face_size_emotion,
+                        "weak_match_threshold": weak_match_threshold,
+                        "consensus_frames_required": consensus_frames_required,
                         "enable_emotion": enable_emotion,
                         "enable_activity": enable_activity,
                         "wing": wing,
@@ -217,7 +250,7 @@ class CCTVManager:
                         "board_zone": board_zone,
                         "student_seating_zone": student_seating_zone,
                         "faculty_workstation_zone": faculty_workstation_zone,
-                        "last_modified": datetime.utcnow(),
+                        "last_modified": app_now(),
                     }
                 },
             )
@@ -249,13 +282,28 @@ class CCTVManager:
         try:
             result = mongo_store.collection("cctv_cameras").update_one(
                 {"_id": camera_id},
-                {"$set": {"enabled": bool(enabled), "last_modified": datetime.utcnow()}},
+                {"$set": {"enabled": bool(enabled), "last_modified": app_now()}},
             )
             if result.modified_count > 0 and not enabled:
                 self._camera_status[camera_id] = "disabled"
             return result.modified_count > 0
         except Exception as exc:
             logger.error(f"Failed to set enabled={enabled} for camera {camera_id}: {exc}")
+            return False
+
+    def set_camera_processing_enabled(self, camera_id: int, processing_enabled: bool) -> bool:
+        try:
+            result = mongo_store.collection("cctv_cameras").update_one(
+                {"_id": camera_id},
+                {"$set": {"processing_enabled": bool(processing_enabled), "last_modified": app_now()}},
+            )
+            if result.modified_count > 0 and not processing_enabled:
+                self._camera_status[camera_id] = "processing-disabled"
+            return result.modified_count > 0
+        except Exception as exc:
+            logger.error(
+                f"Failed to set processing_enabled={processing_enabled} for camera {camera_id}: {exc}"
+            )
             return False
 
     def update_camera_status(self, camera_id: int, status: str, error_message: str = None):

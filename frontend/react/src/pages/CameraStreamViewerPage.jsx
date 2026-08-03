@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { AppShell } from "../components/AppShell";
-import { getCameras, getCameraStatus } from "../lib/admin";
+import { getCameras, getCameraFaceDebug, getCameraStatus } from "../lib/admin";
 
 function getCameraConnectionLabel(camera) {
   if (!camera) {
@@ -56,6 +56,8 @@ export function CameraStreamViewerPage() {
   const [statusLoading, setStatusLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [cameraStatus, setCameraStatus] = useState(null);
+  const [faceDebugLoading, setFaceDebugLoading] = useState(false);
+  const [faceDebug, setFaceDebug] = useState(null);
 
   useEffect(() => {
     loadCameras();
@@ -99,6 +101,7 @@ export function CameraStreamViewerPage() {
     setSelectedCamera(camera);
     setStreamSrc("");
     setCameraStatus(null);
+    setFaceDebug(null);
     setMessage(`Selected camera: ${camera.name}`);
     refreshSelectedCameraStatus(camera.id);
   }
@@ -137,8 +140,32 @@ export function CameraStreamViewerPage() {
 
   function handleStopStream() {
     setStreamSrc("");
+    setFaceDebug(null);
     if (selectedCamera) {
       setMessage(`Stopped ${selectedCamera.name}.`);
+    }
+  }
+
+  async function handleCaptureFaces() {
+    if (!selectedCamera) {
+      setMessage("Select a camera first.");
+      return;
+    }
+
+    setFaceDebugLoading(true);
+    try {
+      const data = await getCameraFaceDebug(selectedCamera.id);
+      setFaceDebug(data);
+      setMessage(
+        data?.face_count
+          ? `Captured ${data.face_count} face ${data.face_count === 1 ? "box" : "boxes"} from ${selectedCamera.name}.`
+          : `No faces detected in ${selectedCamera.name}.`
+      );
+    } catch (error) {
+      setFaceDebug(null);
+      setMessage(error.message || "Unable to capture face boxes.");
+    } finally {
+      setFaceDebugLoading(false);
     }
   }
 
@@ -201,6 +228,9 @@ export function CameraStreamViewerPage() {
               <button className="secondary-button" onClick={() => refreshSelectedCameraStatus()} type="button">
                 {statusLoading ? "Checking..." : "Check status"}
               </button>
+              <button className="secondary-button" onClick={handleCaptureFaces} type="button">
+                {faceDebugLoading ? "Capturing..." : "Capture faces"}
+              </button>
             </div>
           </div>
 
@@ -208,12 +238,49 @@ export function CameraStreamViewerPage() {
 
           <div className="camera-stream-frame-react">
             {streamSrc ? (
-              <img
-                alt={selectedCamera ? `${selectedCamera.name} live stream` : "Camera live stream"}
-                className="camera-stream-image-react"
-                onError={() => setMessage("Unable to open this stream right now.")}
-                src={streamSrc}
-              />
+              <div style={{ position: "relative" }}>
+                <img
+                  alt={selectedCamera ? `${selectedCamera.name} live stream` : "Camera live stream"}
+                  className="camera-stream-image-react"
+                  onError={() => setMessage("Unable to open this stream right now.")}
+                  src={streamSrc}
+                />
+                {faceDebug?.faces?.map((face) => {
+                  const [x, y, width, height] = face.bbox || [];
+                  const frameWidth = faceDebug?.frame_size?.width || 960;
+                  const frameHeight = faceDebug?.frame_size?.height || 540;
+                  return (
+                    <div
+                      key={face.id}
+                      style={{
+                        position: "absolute",
+                        left: `${(x / frameWidth) * 100}%`,
+                        top: `${(y / frameHeight) * 100}%`,
+                        width: `${(width / frameWidth) * 100}%`,
+                        height: `${(height / frameHeight) * 100}%`,
+                        border: "2px solid #34c759",
+                        boxSizing: "border-box",
+                        pointerEvents: "none"
+                      }}
+                    >
+                      <span
+                        style={{
+                          position: "absolute",
+                          top: "-22px",
+                          left: "0",
+                          background: "#34c759",
+                          color: "#0e1116",
+                          fontSize: "12px",
+                          fontWeight: 700,
+                          padding: "2px 6px"
+                        }}
+                      >
+                        {face.label}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             ) : (
               <div className="camera-stream-empty-react">
                 <strong>No live stream running</strong>
@@ -221,6 +288,64 @@ export function CameraStreamViewerPage() {
               </div>
             )}
           </div>
+
+          {faceDebug ? (
+            <section className="panel" style={{ marginTop: "1rem" }}>
+              <div className="section-header">
+                <div>
+                  <h3>Face Debug</h3>
+                  <p>Bounding boxes and cropped face captures from the latest debug snapshot.</p>
+                </div>
+              </div>
+
+              {!faceDebug.faces?.length ? <div className="table-empty">No faces detected in the latest capture.</div> : null}
+
+              {faceDebug.faces?.length ? (
+                <div
+                  style={{
+                    display: "grid",
+                    gap: "1rem",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))"
+                  }}
+                >
+                  {faceDebug.faces.map((face) => (
+                    <article
+                      key={face.id}
+                      style={{
+                        border: "1px solid rgba(255,255,255,0.12)",
+                        borderRadius: "12px",
+                        padding: "0.75rem",
+                        background: "rgba(255,255,255,0.03)"
+                      }}
+                    >
+                      {face.crop_base64 ? (
+                        <img
+                          alt={`${face.label} crop`}
+                          src={`data:image/jpeg;base64,${face.crop_base64}`}
+                          style={{
+                            width: "100%",
+                            aspectRatio: "1 / 1",
+                            objectFit: "cover",
+                            borderRadius: "8px",
+                            marginBottom: "0.75rem"
+                          }}
+                        />
+                      ) : (
+                        <div className="table-empty">Crop unavailable</div>
+                      )}
+                      <strong>{face.label}</strong>
+                      <p style={{ margin: "0.35rem 0 0" }}>
+                        Box: {face.bbox?.join(", ")}
+                      </p>
+                      <p style={{ margin: "0.2rem 0 0" }}>
+                        Size: {face.size?.width} x {face.size?.height}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+          ) : null}
 
           <div className="camera-stream-details-grid-react">
             <article className="metric-card">

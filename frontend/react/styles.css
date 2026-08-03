@@ -1674,21 +1674,22 @@ tbody tr:hover td {
 .camera-card-actions,
 .camera-card-buttons {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
 }
 
 .camera-card-actions {
-  justify-content: space-between;
   flex-wrap: wrap;
 }
 
 .camera-card-buttons {
-  flex-wrap: nowrap;
+  flex: 1 1 320px;
+  flex-wrap: wrap;
+  justify-content: flex-start;
 }
 
 .camera-card-buttons .table-button {
-  white-space: nowrap;
+  flex: 1 1 auto;
 }
 
 .subsection-head {

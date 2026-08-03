@@ -13,7 +13,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Deque, Dict, Optional
 
 import cv2
@@ -46,6 +46,11 @@ except ImportError:
         from backend.mma_dfer_runtime import MMADFERCheckpointRuntime
     except ImportError:
         MMADFERCheckpointRuntime = None
+
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 logger = logging.getLogger(__name__)
 
@@ -533,7 +538,7 @@ class FaceQualityAssessor:
             "occlusion_score": round(occlusion_score, 4),
             "detection_confidence": round(float(detection_confidence or 0.0), 4),
             "quality_score": quality_score,
-            "low_quality": quality_score < float(os.getenv("CHRONOSENSE_EMOTION_QUALITY_THRESHOLD", "0.45")),
+            "low_quality": quality_score < float(os.getenv("CHRONOSENSE_EMOTION_QUALITY_THRESHOLD", "0.40")),
         }
 
     def _estimate_pose(self, landmarks, width, height):
@@ -575,7 +580,7 @@ class TemporalEmotionSmoother:
         self.histories: Dict[str, Deque[Dict]] = defaultdict(lambda: deque(maxlen=self.max_frames))
 
     def update(self, track_key, observation, timestamp=None):
-        timestamp = timestamp or datetime.utcnow()
+        timestamp = timestamp or app_now()
         history = self.histories[track_key]
         history.append({"timestamp": timestamp, **observation})
         cutoff = timestamp - timedelta(seconds=self.window_seconds)
@@ -633,7 +638,10 @@ class TemporalEmotionSmoother:
 
         low_signal = temporal_consensus < float(os.getenv("CHRONOSENSE_EMOTION_CONSENSUS_THRESHOLD", "0.25"))
         if leading_emotion == "Neutral":
-            low_quality_count = sum(1 for item in history if float(item.get("quality_score") or 0.0) < 0.45)
+            low_quality_floor = float(os.getenv("CHRONOSENSE_EMOTION_QUALITY_THRESHOLD", "0.40"))
+            low_quality_count = sum(
+                1 for item in history if float(item.get("quality_score") or 0.0) < low_quality_floor
+            )
             if low_quality_count >= max(2, history_size // 2):
                 smoothed_confidence = smoothed_confidence * 0.65
             if history_size < 3 and smoothed_confidence < 0.35:
@@ -818,7 +826,7 @@ class EmotionPipeline:
         activity=None,
         activity_confidence=0.0,
     ):
-        timestamp = timestamp or datetime.utcnow()
+        timestamp = timestamp or app_now()
         quality = self.quality_assessor.assess(face_roi, landmarks=landmarks, detection_confidence=detection_confidence)
         backend_result = self.backend.predict(face_roi, track_key=track_key, timestamp=timestamp)
         observation = {

@@ -207,6 +207,17 @@ export async function getCameraStatus(cameraId) {
   return apiRequest(`/api/cameras/${cameraId}/status`);
 }
 
+export async function getCameraFaceDebug(cameraId) {
+  return apiRequest(`/api/cameras/${cameraId}/face-debug`);
+}
+
+export async function setCameraProcessingEnabled(cameraId, processingEnabled) {
+  return apiRequest(`/api/cameras/${cameraId}/processing-enabled`, {
+    method: "POST",
+    body: JSON.stringify({ processing_enabled: processingEnabled })
+  });
+}
+
 export async function getEmotionLocations(date) {
   return apiRequest(`/api/emotions/by-location?date=${encodeURIComponent(date)}`);
 }
@@ -471,6 +482,100 @@ export async function getRecognitionLogs({ cameraId, limit = 100 } = {}) {
 
   params.set("limit", String(limit));
   return apiRequest(`/api/cameras/recognition/logs?${params.toString()}`);
+}
+
+export async function getRecognitionReviewRecords({
+  cameraId,
+  reviewStatus,
+  predictedProfileId,
+  limit = 200,
+  sort = "top_score_desc"
+} = {}) {
+  const params = new URLSearchParams();
+
+  if (cameraId) {
+    params.set("camera_id", String(cameraId));
+  }
+
+  if (reviewStatus) {
+    params.set("review_status", reviewStatus);
+  }
+
+  if (predictedProfileId) {
+    params.set("predicted_profile_id", String(predictedProfileId));
+  }
+
+  params.set("limit", String(limit));
+  params.set("sort", sort);
+  return apiRequest(`/api/recognition/review?${params.toString()}`);
+}
+
+export async function updateRecognitionReviewVerdict(recordId, { reviewStatus, note }) {
+  return apiRequest(`/api/recognition/review/${recordId}/verdict`, {
+    method: "POST",
+    body: JSON.stringify({
+      review_status: reviewStatus,
+      note
+    })
+  });
+}
+
+export async function resetRecognitionReviewRecords(cameraId = null) {
+  return apiRequest("/api/recognition/review/reset", {
+    method: "POST",
+    body: JSON.stringify({
+      camera_id: cameraId
+    })
+  });
+}
+
+export async function exportRecognitionReviewCsv({
+  cameraId,
+  reviewStatus,
+  predictedProfileId,
+  limit = 5000,
+  sort = "top_score_desc"
+} = {}) {
+  const params = new URLSearchParams();
+
+  if (cameraId) {
+    params.set("camera_id", String(cameraId));
+  }
+
+  if (reviewStatus) {
+    params.set("review_status", reviewStatus);
+  }
+
+  if (predictedProfileId) {
+    params.set("predicted_profile_id", String(predictedProfileId));
+  }
+
+  params.set("limit", String(limit));
+  params.set("sort", sort);
+
+  const token = getStoredToken();
+  const response = await fetch(`/api/recognition/review/export.csv?${params.toString()}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {}
+  });
+
+  if (!response.ok) {
+    const payload = await response.text();
+    throw new Error(payload || "Unable to export recognition review CSV.");
+  }
+
+  const blob = await response.blob();
+  const downloadUrl = window.URL.createObjectURL(blob);
+  const disposition = response.headers.get("content-disposition") || "";
+  const filenameMatch = disposition.match(/filename=\"([^\"]+)\"/);
+  const filename = filenameMatch?.[1] || "recognition-review.csv";
+
+  const anchor = document.createElement("a");
+  anchor.href = downloadUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.URL.revokeObjectURL(downloadUrl);
 }
 
 export async function getUnknownSnapshots(cameraId, limit = 50) {

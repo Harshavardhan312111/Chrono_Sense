@@ -18,6 +18,7 @@ import { OverviewDashboardPage } from "./pages/OverviewDashboardPage";
 import { PersonEmotionTimelinePage } from "./pages/PersonEmotionTimelinePage";
 import { PeopleWorkspacePage } from "./pages/PeopleWorkspacePage";
 import { RecognitionLogsPage } from "./pages/RecognitionLogsPage";
+import { RecognitionReviewPage } from "./pages/RecognitionReviewPage";
 import { ReportsCenterPage } from "./pages/ReportsCenterPage";
 import { WorkspaceScaffoldPage } from "./pages/WorkspaceScaffoldPage";
 import { LiveOperationsPage } from "./pages/LiveOperationsPage";
@@ -138,6 +139,14 @@ export default function App() {
         element={
           <ProtectedRoute capability={CAPABILITY_RECOGNITION_VIEW}>
             <RecognitionLogsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/recognition/review"
+        element={
+          <ProtectedRoute capability={CAPABILITY_RECOGNITION_MANAGE}>
+            <RecognitionReviewPage />
           </ProtectedRoute>
         }
       />

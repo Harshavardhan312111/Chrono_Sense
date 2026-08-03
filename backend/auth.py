@@ -5,7 +5,7 @@ Authentication manager for ChronoSense.
 import hashlib
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import timedelta
 try:
     from rbac import get_role_capabilities, get_role_label, get_user_scope
 except ImportError:
@@ -15,6 +15,10 @@ try:
     from mongo_store import mongo_store
 except ImportError:
     from backend.mongo_store import mongo_store
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ class AuthManager:
     def _seed_default_users(self):
         users = mongo_store.collection("users")
         assignments = mongo_store.collection("class_assignments")
-        now = datetime.utcnow()
+        now = app_now()
         default_users = [
             ("admin", "admin123", "admin@chronosense.local", "admin", "System", "Administrator"),
             ("manager", "manager123", "manager@chronosense.local", "manager", "Campus", "Manager"),
@@ -115,13 +119,13 @@ class AuthManager:
                 return None
 
             token = secrets.token_urlsafe(32)
-            expires_at = datetime.utcnow() + timedelta(days=1)
+            expires_at = app_now() + timedelta(days=1)
             mongo_store.collection("sessions").insert_one(
                 {
                     "_id": token,
                     "token": token,
                     "user_id": user["_id"],
-                    "created_at": datetime.utcnow(),
+                    "created_at": app_now(),
                     "expires_at": expires_at,
                 }
             )
@@ -133,7 +137,7 @@ class AuthManager:
     def verify_token(self, token):
         try:
             session = mongo_store.collection("sessions").find_one(
-                {"_id": token, "expires_at": {"$gt": datetime.utcnow()}}
+                {"_id": token, "expires_at": {"$gt": app_now()}}
             )
             if not session:
                 return None

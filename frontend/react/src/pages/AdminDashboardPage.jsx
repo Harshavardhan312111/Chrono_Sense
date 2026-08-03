@@ -57,6 +57,8 @@ const initialProfileForm = {
   department: "",
   class_name: "",
   section_name: "",
+  isAddingSection: false,
+  newSectionName: "",
   roll_number: "",
   check_in_time: "09:00",
   check_out_time: "17:00"
@@ -201,6 +203,7 @@ export function AdminDashboardPage({
   const streamRef = useRef(null);
   const captureCanvasRef = useRef(null);
   const editFileInputRefs = useRef({});
+  const newFileInputRefs = useRef({});
   const location = useLocation();
   const { user } = useAuth();
   const roleView = getRoleView(user?.role);
@@ -248,6 +251,13 @@ export function AdminDashboardPage({
   const [creatingProfile, setCreatingProfile] = useState(false);
   const [newProfile, setNewProfile] = useState(initialProfileForm);
   const [newProfileIncludeImages, setNewProfileIncludeImages] = useState(false);
+  const [newProfileImages, setNewProfileImages] = useState({});
+  const [newProfilePreviewUrls, setNewProfilePreviewUrls] = useState({});
+  const [createCameraOpen, setCreateCameraOpen] = useState(false);
+  const [createCameraLoading, setCreateCameraLoading] = useState(false);
+  const [createCameraError, setCreateCameraError] = useState("");
+  const [createCameraReady, setCreateCameraReady] = useState(false);
+  const [selectedCreateCaptureView, setSelectedCreateCaptureView] = useState(FACE_VIEW_FIELDS[0].key);
   const [bulkFile, setBulkFile] = useState(null);
   const [bulkUploading, setBulkUploading] = useState(false);
   const [attendanceDate, setAttendanceDate] = useState(getTodayDateInputValue());
@@ -336,6 +346,24 @@ export function AdminDashboardPage({
     };
   }, [editingProfileImages]);
 
+  useEffect(() => {
+    const nextPreviewUrls = FACE_VIEW_FIELDS.reduce((accumulator, view) => {
+      const file = newProfileImages[view.key];
+      accumulator[view.key] = file ? URL.createObjectURL(file) : "";
+      return accumulator;
+    }, {});
+
+    setNewProfilePreviewUrls(nextPreviewUrls);
+
+    return () => {
+      Object.values(nextPreviewUrls).forEach((url) => {
+        if (url) {
+          URL.revokeObjectURL(url);
+        }
+      });
+    };
+  }, [newProfileImages]);
+
   useEffect(() => () => {
     stopEditCameraStream();
   }, []);
@@ -358,6 +386,25 @@ export function AdminDashboardPage({
 
     attachEditStream();
   }, [editCameraOpen, selectedEditCaptureView]);
+
+  useEffect(() => {
+    async function attachCreateStream() {
+      if (!createCameraOpen || !videoRef.current || !streamRef.current) {
+        return;
+      }
+
+      try {
+        videoRef.current.srcObject = streamRef.current;
+        await videoRef.current.play();
+        setCreateCameraReady(true);
+      } catch (error) {
+        setCreateCameraReady(false);
+        setCreateCameraError(error?.message || "Unable to render the camera preview.");
+      }
+    }
+
+    attachCreateStream();
+  }, [createCameraOpen, selectedCreateCaptureView]);
 
   useEffect(() => {
     if (!isTeacher) {
@@ -598,6 +645,13 @@ export function AdminDashboardPage({
 
   function updateNewProfileField(name, value) {
     setNewProfile((current) => {
+      if (name === "section_name" && value === "__new__") {
+        return {
+          ...current,
+          section_name: "",
+          isAddingSection: true
+        };
+      }
       if (name === "profile_type") {
         return {
           ...current,
@@ -605,7 +659,18 @@ export function AdminDashboardPage({
           department: value === "faculty" ? current.department : "",
           class_name: value === "student" ? current.class_name : "",
           section_name: value === "student" ? current.section_name : "",
-          roll_number: value === "student" ? current.roll_number : ""
+          roll_number: value === "student" ? current.roll_number : "",
+          isAddingSection: false,
+          newSectionName: ""
+        };
+      }
+      if (name === "class_name") {
+        return {
+          ...current,
+          class_name: value,
+          section_name: "",
+          isAddingSection: false,
+          newSectionName: ""
         };
       }
       return {
@@ -617,7 +682,6 @@ export function AdminDashboardPage({
 
   async function handleCreateProfile(event) {
     event.preventDefault();
-    const formData = new FormData(event.currentTarget);
     const payload = new FormData();
     [
       "profile_type",
@@ -630,14 +694,14 @@ export function AdminDashboardPage({
       "check_in_time",
       "check_out_time"
     ].forEach((key) => {
-      const value = formData.get(key)?.toString().trim();
+      const value = newProfile[key]?.toString().trim();
       if (value) {
         payload.append(key, value);
       }
     });
     if (newProfileIncludeImages) {
       FACE_VIEW_FIELDS.forEach((view) => {
-        const file = formData.get(`image_${view.key}`);
+        const file = newProfileImages[view.key];
         if (file instanceof File && file.size > 0) {
           payload.append(`image_${view.key}`, file);
         }
@@ -647,6 +711,11 @@ export function AdminDashboardPage({
     try {
       await registerProfile(payload);
       setCreatingProfile(false);
+      closeCreateCamera();
+      setNewProfile(initialProfileForm);
+      setNewProfileIncludeImages(false);
+      setNewProfileImages({});
+      setSelectedCreateCaptureView(FACE_VIEW_FIELDS[0].key);
       setProfilesMessage(
         newProfileIncludeImages
           ? "Profile saved with images."
@@ -830,6 +899,123 @@ export function AdminDashboardPage({
     editFileInputRefs.current[viewKey]?.click();
   }
 
+  function stopCreateCameraStream() {
+    setCreateCameraReady(false);
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }
+
+  async function openCreateCamera(viewKey = FACE_VIEW_FIELDS[0].key) {
+    const supportMessage = getCameraSupportMessage();
+
+    if (supportMessage) {
+      setCreateCameraError(supportMessage);
+      return;
+    }
+
+    setCreateCameraLoading(true);
+    setCreateCameraError("");
+    setSelectedCreateCaptureView(viewKey);
+
+    try {
+      stopCreateCameraStream();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user"
+        },
+        audio: false
+      });
+
+      streamRef.current = stream;
+      setCreateCameraOpen(true);
+    } catch (error) {
+      if (error?.name === "NotAllowedError") {
+        setCreateCameraError("Camera permission was denied. Allow camera access in Chrome and try again.");
+      } else if (error?.name === "NotFoundError") {
+        setCreateCameraError("No camera was found on this device.");
+      } else {
+        setCreateCameraError(error?.message || "Unable to access the camera.");
+      }
+      setCreateCameraOpen(false);
+    } finally {
+      setCreateCameraLoading(false);
+    }
+  }
+
+  function closeCreateCamera() {
+    stopCreateCameraStream();
+    setCreateCameraOpen(false);
+    setCreateCameraError("");
+  }
+
+  async function captureCreatePhoto() {
+    const video = videoRef.current;
+    const canvas = captureCanvasRef.current;
+
+    if (!video || !canvas || !selectedCreateCaptureView) {
+      setCreateCameraError("Camera preview is not ready yet.");
+      return;
+    }
+
+    if (!createCameraReady || !video.videoWidth || !video.videoHeight) {
+      setCreateCameraError("Wait for the camera preview to load before capturing.");
+      return;
+    }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext("2d");
+
+    if (!context) {
+      setCreateCameraError("Unable to prepare captured image.");
+      return;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise((resolve) => {
+      canvas.toBlob(resolve, "image/jpeg", 0.92);
+    });
+
+    if (!blob) {
+      setCreateCameraError("Unable to capture photo. Please try again.");
+      return;
+    }
+
+    const capturedFile = new File(
+      [blob],
+      `${newProfile?.name?.trim().replace(/\s+/g, "-").toLowerCase() || "profile"}-${selectedCreateCaptureView}.jpg`,
+      { type: "image/jpeg" }
+    );
+
+    setNewProfileImages((current) => ({
+      ...current,
+      [selectedCreateCaptureView]: capturedFile
+    }));
+    setProfilesMessage(`${FACE_VIEW_FIELDS.find((view) => view.key === selectedCreateCaptureView)?.label || "Selected"} image captured.`);
+    setCreateCameraError("");
+  }
+
+  function updateNewProfileFile(viewKey, event) {
+    const file = event.target.files?.[0] || null;
+
+    setNewProfileImages((current) => ({
+      ...current,
+      [viewKey]: file
+    }));
+  }
+
+  function triggerNewProfileFilePicker(viewKey) {
+    newFileInputRefs.current[viewKey]?.click();
+  }
+
   function closeEditModal() {
     closeEditCamera();
     setEditingProfileImages({});
@@ -857,6 +1043,24 @@ export function AdminDashboardPage({
         newSectionName: ""
       };
     });
+    setProfilesMessage("");
+  }
+
+  function saveNewProfileSection() {
+    const normalized = (newProfile?.newSectionName || "").trim();
+
+    if (!normalized) {
+      setProfilesMessage("Enter a section name before saving it.");
+      return;
+    }
+
+    setCustomStudentSections((current) => (current.includes(normalized) ? current : [...current, normalized]));
+    setNewProfile((current) => ({
+      ...current,
+      section_name: normalized,
+      isAddingSection: false,
+      newSectionName: ""
+    }));
     setProfilesMessage("");
   }
 
@@ -1243,6 +1447,9 @@ export function AdminDashboardPage({
   const requiresDashboardStudentScope = dashboardRoleFilter === "student" && (!dashboardClassFilter || !dashboardSectionFilter);
   const availableSections = Array.from(
     new Set([...(profileFilters.sections_by_class?.[profileClassFilter] || []), ...customStudentSections])
+  );
+  const createProfileSections = Array.from(
+    new Set([...(profileFilters.sections_by_class?.[newProfile.class_name] || []), ...customStudentSections])
   );
   const requiresStudentScope = profileTypeFilter === "student" && (!profileClassFilter || !profileSectionFilter);
   const visibleProfiles = profiles.filter((profile) => matchesSearch(profile, profileSearchQuery));
@@ -2661,14 +2868,36 @@ export function AdminDashboardPage({
                     </label>
                     <label className="filter-field">
                       <span>Section</span>
-                      <select name="section_name" onChange={(event) => updateNewProfileField("section_name", event.target.value)} value={newProfile.section_name}>
+                      <select
+                        name="section_name"
+                        onChange={(event) => updateNewProfileField("section_name", event.target.value)}
+                        value={newProfile.isAddingSection ? "__new__" : newProfile.section_name}
+                      >
                         <option value="">Select section</option>
-                        {availableSections.map((sectionName) => (
+                        {createProfileSections.map((sectionName) => (
                           <option key={sectionName} value={sectionName}>{sectionName}</option>
                         ))}
+                        <option value="__new__">Add new section</option>
                       </select>
                     </label>
                   </div>
+                  {newProfile.isAddingSection ? (
+                    <div className="split-fields">
+                      <label className="filter-field">
+                        <span>New section</span>
+                        <input
+                          onChange={(event) => updateNewProfileField("newSectionName", event.target.value)}
+                          placeholder="Enter section name"
+                          value={newProfile.newSectionName}
+                        />
+                      </label>
+                      <div className="section-actions">
+                        <button className="secondary-button" onClick={saveNewProfileSection} type="button">
+                          Save section
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                   <label className="filter-field">
                     <span>Roll number</span>
                     <input name="roll_number" onChange={(event) => updateNewProfileField("roll_number", event.target.value)} value={newProfile.roll_number} />
@@ -2694,13 +2923,91 @@ export function AdminDashboardPage({
               )}
               {newProfileIncludeImages ? (
                 <>
-                  <div className="report-filter-grid">
-                    {FACE_VIEW_FIELDS.map((view) => (
-                      <label className="filter-field" key={`create-${view.key}`}>
-                        <span>{view.label}</span>
-                        <input accept="image/*" name={`image_${view.key}`} type="file" />
-                      </label>
-                    ))}
+                  <div className="filter-field camera-form-wide">
+                    <span>Required face views</span>
+                    <p className="inline-note capture-help-text">
+                      Use <strong>Upload</strong> to open the file picker, or <strong>Capture</strong> to take the image directly in this form.
+                    </p>
+                    {createCameraError ? <p className="inline-note">{createCameraError}</p> : null}
+                    {createCameraOpen ? (
+                      <div className="camera-capture-panel">
+                        <div className="capture-toolbar">
+                          <div className="capture-session-copy">
+                            Capturing for <strong>{FACE_VIEW_FIELDS.find((view) => view.key === selectedCreateCaptureView)?.label}</strong>
+                          </div>
+                          <button className="primary-button" onClick={captureCreatePhoto} type="button">
+                            Capture photo
+                          </button>
+                          <button className="secondary-button" onClick={closeCreateCamera} type="button">
+                            Close camera
+                          </button>
+                        </div>
+                        <div className="frame-preview">
+                          <video autoPlay muted playsInline ref={videoRef} />
+                          {!createCameraReady ? <div className="camera-preview-placeholder">Loading camera preview...</div> : null}
+                        </div>
+                        <p className="inline-note">
+                          Align the face for <strong>{FACE_VIEW_FIELDS.find((view) => view.key === selectedCreateCaptureView)?.label}</strong>, then capture.
+                        </p>
+                      </div>
+                    ) : null}
+                    <div className="multi-view-upload-grid">
+                      {FACE_VIEW_FIELDS.map((view) => (
+                        <div className="capture-input-card" key={`create-${view.key}`}>
+                          <div className="capture-card-header">
+                            <span>{view.label}</span>
+                            <span className={`status-pill ${newProfileImages[view.key] ? "present" : "absent"}`}>
+                              {newProfileImages[view.key] ? "Ready" : "Pending"}
+                            </span>
+                          </div>
+                          <input
+                            accept="image/*"
+                            hidden
+                            onChange={(event) => updateNewProfileFile(view.key, event)}
+                            ref={(node) => {
+                              newFileInputRefs.current[view.key] = node;
+                            }}
+                            type="file"
+                          />
+                          <div className="capture-card-footer">
+                            <button className="secondary-button" onClick={() => triggerNewProfileFilePicker(view.key)} type="button">
+                              Upload
+                            </button>
+                            <button
+                              className={`secondary-button ${selectedCreateCaptureView === view.key ? "active-capture-button" : ""}`}
+                              disabled={createCameraLoading}
+                              onClick={() => openCreateCamera(view.key)}
+                              type="button"
+                            >
+                              {createCameraLoading && selectedCreateCaptureView === view.key
+                                ? "Opening..."
+                                : createCameraOpen && selectedCreateCaptureView === view.key
+                                  ? "Capture active"
+                                  : "Capture"}
+                            </button>
+                            {newProfileImages[view.key] ? (
+                              <button
+                                className="ghost-button"
+                                onClick={() =>
+                                  setNewProfileImages((current) => ({
+                                    ...current,
+                                    [view.key]: null
+                                  }))
+                                }
+                                type="button"
+                              >
+                                Remove
+                              </button>
+                            ) : null}
+                          </div>
+                          {newProfilePreviewUrls[view.key] ? (
+                            <div className="frame-preview compact-preview">
+                              <img alt={`${view.label} preview`} src={newProfilePreviewUrls[view.key]} />
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                   <p className="inline-note">
                     Upload all five images to complete the profile immediately. If you leave this unchecked, only the profile details will be saved.
@@ -2716,6 +3023,7 @@ export function AdminDashboardPage({
                 </button>
               </div>
             </form>
+            <canvas hidden ref={captureCanvasRef} />
           </div>
         </div>
       ) : null}

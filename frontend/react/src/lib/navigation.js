@@ -5,6 +5,7 @@ import {
   ClipboardList,
   FileText,
   LayoutDashboard,
+  ScanSearch,
   Sparkles,
   Users
 } from "lucide-react";
@@ -15,6 +16,8 @@ import {
   CAPABILITY_EMOTIONS_VIEW,
   CAPABILITY_OVERVIEW_VIEW,
   CAPABILITY_PEOPLE_VIEW,
+  CAPABILITY_RECOGNITION_MANAGE,
+  CAPABILITY_RECOGNITION_VIEW,
   getRoleLabel,
   hasCapability
 } from "./rbac";
@@ -68,6 +71,23 @@ export function getNavigationSections(user) {
     sections.push({
       label: "Operations",
       items: operationItems
+    });
+  }
+
+  if (hasCapability(user, CAPABILITY_RECOGNITION_VIEW) || hasCapability(user, CAPABILITY_RECOGNITION_MANAGE)) {
+    const recognitionItems = [];
+    if (hasCapability(user, CAPABILITY_RECOGNITION_MANAGE)) {
+      recognitionItems.push(
+        { label: "Validation", to: "/recognition/validation", icon: ScanSearch },
+        { label: "Threshold Review", to: "/recognition/review", icon: BarChart3 }
+      );
+    }
+    if (hasCapability(user, CAPABILITY_RECOGNITION_VIEW)) {
+      recognitionItems.push({ label: "Logs", to: "/recognition/logs", icon: FileText });
+    }
+    sections.push({
+      label: "Recognition",
+      items: recognitionItems
     });
   }
 

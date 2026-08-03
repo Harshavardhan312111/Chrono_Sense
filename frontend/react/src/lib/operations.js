@@ -2,18 +2,10 @@ import {
   getOperationsSnapshot
 } from "./admin";
 
+import { formatDateTimeInAppTimezone } from "./time";
+
 export function formatTimestamp(value) {
-  if (!value) {
-    return "-";
-  }
-
-  const date = new Date(value);
-
-  if (Number.isNaN(date.getTime())) {
-    return String(value);
-  }
-
-  return date.toLocaleString();
+  return formatDateTimeInAppTimezone(value);
 }
 
 export function normalizeNumber(value, fallback = 0) {

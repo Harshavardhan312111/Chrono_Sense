@@ -113,12 +113,32 @@ function getTimelineEmotionLabel(event, showAdvanced) {
       return `${rawEmotion} (raw)`;
     }
     if (smoothedEmotion === "LowSignal") {
-      return "LowSignal";
+      return "Neutral";
     }
     return usableEmotion || "-";
   }
 
-  return usableEmotion || rawEmotion || "-";
+  if ((usableEmotion || rawEmotion) === "LowSignal") {
+    return "Neutral";
+  }
+  return usableEmotion || rawEmotion || "Neutral";
+}
+
+function getTimelineEmotionScores(event) {
+  if (event?.smoothed_emotion && event.smoothed_emotion !== "LowSignal") {
+    return event.smoothed_scores || event.raw_scores || event.all_emotions;
+  }
+  return event?.raw_scores || event?.all_emotions || event?.smoothed_scores;
+}
+
+function getTimelineEmotionConfidence(event, showAdvanced) {
+  if (showAdvanced && event?.smoothed_emotion && event.smoothed_emotion !== "LowSignal") {
+    return event?.smoothed_confidence || event?.emotion_confidence || 0;
+  }
+  if (event?.smoothed_emotion === "LowSignal" && Number(event?.raw_confidence || 0) > 0) {
+    return event.raw_confidence;
+  }
+  return event?.emotion_confidence || event?.smoothed_confidence || event?.raw_confidence || 0;
 }
 
 function normalizeTrendRows(dailyTrends) {
@@ -167,7 +187,7 @@ function getDiagnosticEmotionLabel(primaryEmotion, rawEmotion, totalDetections, 
     return `${rawEmotion} (raw)`;
   }
   if (Number(totalDetections || 0) > 0 && Number(usableDetections || 0) === 0) {
-    return "LowSignal";
+    return "Neutral";
   }
   return "-";
 }
@@ -1021,8 +1041,8 @@ export function EmotionAnalyticsPage({ mode }) {
                     <td>{formatEventTimestamp(event.timestamp)}</td>
                     <td>{getTimelineEmotionLabel(event, showAdvanced)}</td>
                     {showAdvanced ? <td>{event.educational_state || event.derived_emotion || "-"}</td> : null}
-                    <td>{formatEmotionScores(event.smoothed_scores || event.raw_scores || event.all_emotions) || "-"}</td>
-                    <td>{formatPercent(event.emotion_confidence || 0)}</td>
+                    <td>{formatEmotionScores(getTimelineEmotionScores(event)) || "-"}</td>
+                    <td>{formatPercent(getTimelineEmotionConfidence(event, showAdvanced))}</td>
                     {showAdvanced ? <td>{Math.round((event.quality_score || 0) * 100)}%</td> : null}
                     <td>{formatPercent(event.recognition_confidence || 0)}</td>
                     <td>{event.location || "-"}</td>

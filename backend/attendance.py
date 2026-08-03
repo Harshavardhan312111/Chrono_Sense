@@ -15,19 +15,21 @@ try:
     from mongo_store import mongo_store
 except ImportError:
     from backend.mongo_store import mongo_store
+try:
+    from time_utils import APP_TIMEZONE, UTC, app_now
+except ImportError:
+    from backend.time_utils import APP_TIMEZONE, UTC, app_now
 
 logger = logging.getLogger(__name__)
-
-APP_TIMEZONE = ZoneInfo("Asia/Kolkata")
-UTC = ZoneInfo("UTC")
 LOW_SIGNAL_EMOTION = "LowSignal"
+
+
+def _display_emotion_label(emotion, emotion_data=None):
+    value = emotion or (emotion_data or {}).get("smoothed_emotion") or (emotion_data or {}).get("raw_emotion") or LOW_SIGNAL_EMOTION
+    if value == LOW_SIGNAL_EMOTION:
+        return "Neutral"
+    return value
 ATTENDANCE_RECOGNITION_FLOOR = 0.39
-
-
-def app_now():
-    return datetime.now(APP_TIMEZONE)
-
-
 def to_ist_time(utc_time_str):
     try:
         if not utc_time_str:
@@ -322,7 +324,7 @@ class AttendanceTracker:
                     self.min_attendance_recognition_confidence,
                 )
                 return False
-            now = datetime.utcnow()
+            now = app_now()
             date_str = now.strftime("%Y-%m-%d")
             if profile_id and profile_id > 0:
                 if not self.detection_cache.should_log(profile_id):
@@ -330,7 +332,7 @@ class AttendanceTracker:
                 self.detection_cache.mark_logged(profile_id)
 
             emotion_data = emotion_data or {}
-            resolved_emotion = emotion or emotion_data.get("smoothed_emotion") or emotion_data.get("raw_emotion") or LOW_SIGNAL_EMOTION
+            resolved_emotion = _display_emotion_label(emotion, emotion_data)
             emotion_confidence = float(
                 emotion_data.get("emotion_confidence",
                 emotion_data.get("smoothed_confidence",
@@ -370,6 +372,13 @@ class AttendanceTracker:
                     "emotion_model": emotion_data.get("emotion_model"),
                     "pipeline_version": emotion_data.get("pipeline_version"),
                     "low_signal_state": bool(emotion_data.get("low_signal_state")),
+                    "quality_band": emotion_data.get("quality_band"),
+                    "face_size_px": int(emotion_data.get("face_size_px") or emotion_data.get("face_size") or 0),
+                    "preprocess_variant": emotion_data.get("preprocess_variant"),
+                    "recovery_stage": emotion_data.get("recovery_stage"),
+                    "temporal_consensus": float(emotion_data.get("temporal_consensus") or 0.0),
+                    "decision_reason": emotion_data.get("decision_reason"),
+                    "weak_match_threshold": float(emotion_data.get("weak_match_threshold") or 0.0),
                     "emotion_unavailable_reason": emotion_data.get("emotion_unavailable_reason"),
                     "legacy_emotion_source": emotion_data.get("legacy_emotion_source"),
                     "frame_path": frame_path,
@@ -485,7 +494,7 @@ class AttendanceTracker:
             emotion_data.get("raw_confidence",
             emotion_data.get("confidence", 0.0))))
         )
-        resolved_emotion = emotion or emotion_data.get("smoothed_emotion") or emotion_data.get("raw_emotion") or LOW_SIGNAL_EMOTION
+        resolved_emotion = _display_emotion_label(emotion, emotion_data)
         if not profile_id and unknown_face_id is None:
             return False
         event_id = mongo_store.next_id("emotion_events")
@@ -533,6 +542,10 @@ class AttendanceTracker:
                 "occlusion_score": float(emotion_data.get("occlusion_score") or 0.0),
                 "attention": float(emotion_data.get("attention") or 0.0),
                 "engagement": float(emotion_data.get("engagement") or 0.0),
+                "quality_band": emotion_data.get("quality_band"),
+                "face_size_px": int(emotion_data.get("face_size_px") or emotion_data.get("face_size") or 0),
+                "preprocess_variant": emotion_data.get("preprocess_variant"),
+                "recovery_stage": emotion_data.get("recovery_stage"),
                 "emotion_model": emotion_data.get("emotion_model"),
                 "reasoning_model": emotion_data.get("reasoning_model"),
                 "pipeline_version": emotion_data.get("pipeline_version"),
@@ -544,10 +557,12 @@ class AttendanceTracker:
                 "low_signal_state": bool(emotion_data.get("low_signal_state")),
                 "temporal_consensus": float(emotion_data.get("temporal_consensus") or 0.0),
                 "history_size": int(emotion_data.get("history_size") or 0),
+                "decision_reason": emotion_data.get("decision_reason"),
+                "weak_match_threshold": float(emotion_data.get("weak_match_threshold") or 0.0),
                 "emotion_unavailable_reason": emotion_data.get("emotion_unavailable_reason"),
                 "legacy_emotion_source": emotion_data.get("legacy_emotion_source"),
                 "date": timestamp.strftime("%Y-%m-%d") if isinstance(timestamp, datetime) else None,
-                "created_at": datetime.utcnow(),
+                "created_at": app_now(),
             }
         )
         return True
@@ -587,7 +602,7 @@ class AttendanceTracker:
         try:
             if not self.activity_cache.should_log(profile_id, unknown_face_id, location):
                 return False
-            now = datetime.utcnow()
+            now = app_now()
             date_str = now.strftime("%Y-%m-%d")
             log_id = mongo_store.next_id("activity_log")
             self._activity_collection().insert_one(
@@ -623,7 +638,7 @@ class AttendanceTracker:
             if not self.class_activity_cache.should_log(camera_id, student_label, faculty_label, context_label):
                 return False
 
-            now = activity_payload.get("timestamp") if isinstance(activity_payload.get("timestamp"), datetime) else datetime.utcnow()
+            now = activity_payload.get("timestamp") if isinstance(activity_payload.get("timestamp"), datetime) else app_now()
             date_str = now.strftime("%Y-%m-%d")
             payload = dict(activity_payload)
             payload["_id"] = mongo_store.next_id("class_activity_log")
@@ -957,7 +972,7 @@ class AttendanceTracker:
             if existing:
                 self._schedule_collection().update_one(
                     {"_id": existing["_id"]},
-                    {"$set": {"start_time": start_time, "end_time": end_time, "updated_at": datetime.utcnow()}},
+                    {"$set": {"start_time": start_time, "end_time": end_time, "updated_at": app_now()}},
                 )
             else:
                 self._schedule_collection().insert_one(
@@ -967,7 +982,7 @@ class AttendanceTracker:
                         "class_name": class_name,
                         "start_time": start_time,
                         "end_time": end_time,
-                        "created_at": datetime.utcnow(),
+                        "created_at": app_now(),
                     }
                 )
             return True
@@ -1074,7 +1089,7 @@ class AttendanceTracker:
                         "check_in_time": check_in_time,
                         "check_out_time": check_out_time,
                         "duration_minutes": duration_minutes,
-                        "updated_at": datetime.utcnow(),
+                        "updated_at": app_now(),
                     }
                 },
             )

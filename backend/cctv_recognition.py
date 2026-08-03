@@ -6,6 +6,8 @@ Integrates with existing AI engine, database, and attendance system
 
 import cv2
 import numpy as np
+import csv
+import io
 import json
 import threading
 import time
@@ -13,7 +15,7 @@ import logging
 import base64
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
@@ -32,6 +34,11 @@ try:
     from class_activity_pipeline import ClassActivityPipeline
 except ImportError:
     from backend.class_activity_pipeline import ClassActivityPipeline
+
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 logger = logging.getLogger(__name__)
 SNAPSHOT_RETENTION_HOURS = 24
@@ -79,10 +86,6 @@ try:
 except ImportError:
     ACTIVITY_DETECTION_AVAILABLE = False
     logger.warning("⚠️ Lite pose detector not available - activity detection will be skipped")
-
-# IST timezone offset: UTC+5:30
-IST_OFFSET = timedelta(hours=5, minutes=30)
-
 
 class CCTVRecognitionEngine:
     """
@@ -162,6 +165,7 @@ class CCTVRecognitionEngine:
         self.face_position_cache = defaultdict(list)  # flat list per camera
         self.unknown_face_counter = defaultdict(int)
         self.unknown_face_candidates = defaultdict(dict)
+        self.recognition_temporal_history = defaultdict(lambda: deque(maxlen=max(3, int(os.getenv("CHRONOSENSE_RECOGNITION_WINDOW_FRAMES", "6")))))
         
         # Position matching: if face center is within 80px of a known face, it's the same person
         # At 640x480, 80px is about 12% of frame width — reasonable for a seated person's movement
@@ -204,6 +208,11 @@ class CCTVRecognitionEngine:
         self.class_activity_pipeline = ClassActivityPipeline()
         self.latest_class_activity = {}
         self.latest_activity_reason = {}
+        self.default_min_face_size_identity = max(20, int(os.getenv("CHRONOSENSE_MIN_FACE_SIZE_IDENTITY", "36")))
+        self.default_weak_match_threshold = float(
+            os.getenv("CHRONOSENSE_WEAK_MATCH_THRESHOLD", str(max(0.24, self.ai_engine.recognition_threshold - 0.06)))
+        )
+        self.default_consensus_frames_required = max(2, int(os.getenv("CHRONOSENSE_RECOGNITION_CONSENSUS_FRAMES_REQUIRED", "3")))
 
         # Frame skip for performance (process every Nth frame).
         # Default to 1 so every captured frame is eligible for processing.
@@ -293,6 +302,10 @@ class CCTVRecognitionEngine:
                 "inference_width": 1,
                 "target_fps": 1,
                 "recognition_threshold_override": 1,
+                "min_face_size_identity": 1,
+                "min_face_size_emotion": 1,
+                "weak_match_threshold": 1,
+                "consensus_frames_required": 1,
                 "enable_emotion": 1,
                 "enable_activity": 1,
                 "camera_context": 1,
@@ -360,11 +373,48 @@ class CCTVRecognitionEngine:
             self.ai_engine.camera_thresholds[camera_name] = threshold_override
             self.ai_engine.camera_thresholds[camera_id] = threshold_override
 
+        def _coerce_int(value, default, floor):
+            try:
+                return max(floor, int(value))
+            except (TypeError, ValueError):
+                return default
+
+        def _coerce_float(value, default, floor=0.0):
+            try:
+                return max(floor, float(value))
+            except (TypeError, ValueError):
+                return default
+
+        min_face_size_identity = _coerce_int(
+            doc.get("min_face_size_identity"),
+            self.default_min_face_size_identity,
+            20,
+        )
+        min_face_size_emotion = _coerce_int(
+            doc.get("min_face_size_emotion"),
+            self.min_emotion_face_size,
+            24,
+        )
+        weak_match_threshold = _coerce_float(
+            doc.get("weak_match_threshold"),
+            self.default_weak_match_threshold,
+            0.1,
+        )
+        consensus_frames_required = _coerce_int(
+            doc.get("consensus_frames_required"),
+            self.default_consensus_frames_required,
+            2,
+        )
+
         return {
             "camera_name": camera_name,
             "inference_width": inference_width,
             "target_fps": target_fps,
             "recognition_threshold_override": threshold_override,
+            "min_face_size_identity": min_face_size_identity,
+            "min_face_size_emotion": min_face_size_emotion,
+            "weak_match_threshold": weak_match_threshold,
+            "consensus_frames_required": consensus_frames_required,
             "enable_emotion": self.enable_emotion_detection if doc.get("enable_emotion") is None else bool(doc.get("enable_emotion")),
             "enable_activity": self.enable_activity_detection if doc.get("enable_activity") is None else bool(doc.get("enable_activity")),
             "camera_context": doc.get("camera_context") or "mixed",
@@ -533,7 +583,7 @@ class CCTVRecognitionEngine:
                     name=face.get("name", "Unknown"),
                     location=camera_name,
                     camera_id=camera_id,
-                    timestamp=datetime.utcnow(),
+                    timestamp=app_now(),
                     frame_path=face.get("frame_path"),
                     recognition_confidence=face.get("confidence", 0.0),
                     emotion=face.get("emotion", LOW_SIGNAL_EMOTION),
@@ -559,7 +609,7 @@ class CCTVRecognitionEngine:
                         name=face.get("name"),
                         location=camera_name,
                         camera_id=camera_id,
-                        timestamp=datetime.utcnow(),
+                        timestamp=app_now(),
                         frame_path=face.get("frame_path"),
                         recognition_confidence=face.get("confidence", 0.0),
                         emotion=face.get("emotion", LOW_SIGNAL_EMOTION),
@@ -720,6 +770,7 @@ class CCTVRecognitionEngine:
                     camera_id=runtime_config.get("camera_name", camera_id),
                     enable_emotion=runtime_config.get("enable_emotion", self.enable_emotion_detection),
                     enable_activity=runtime_config.get("enable_activity", self.enable_activity_detection),
+                    runtime_config=runtime_config,
                 )
                 
                 if match and match.get("recognized"):  # Known face
@@ -732,11 +783,24 @@ class CCTVRecognitionEngine:
                             snapshot_path = self._save_face_snapshot(face_crop_retry, camera_id, match['name'], match.get('profile_id'))
                     match['frame_path'] = snapshot_path
                     match['bbox'] = list(face_bbox)[:4] if len(face_bbox) >= 4 else []
+                    review_snapshot_path = self._save_review_snapshot(
+                        face_crop,
+                        camera_id,
+                        match.get("name"),
+                        match.get("profile_id"),
+                    )
+                    review_candidate = self._build_review_candidate(
+                        camera_id=camera_id,
+                        camera_name=runtime_config.get("camera_name", camera_id),
+                        recognition_debug=match.get("recognition_debug") or {},
+                        snapshot_path=review_snapshot_path,
+                    )
+                    self.upsert_recognition_review_candidate(review_candidate)
                     
                     known_faces.append(match)
                     frame_debug_counts["recognized"] += 1
                     if match.get("emotion_available"):
-                        self.last_emotion_detection_at[camera_id] = datetime.utcnow().isoformat()
+                        self.last_emotion_detection_at[camera_id] = app_now().isoformat()
                         self.emotion_detection_error[camera_id] = None
                     elif match.get("emotion_unavailable_reason"):
                         self.emotion_detection_error[camera_id] = match.get("emotion_unavailable_reason")
@@ -745,9 +809,6 @@ class CCTVRecognitionEngine:
                     logger.debug(f"   → Detection dict keys: {list(match.keys())}")
                     logger.debug(f"   → Activity: {match.get('activity', 'KEY_NOT_FOUND')} | Confidence: {match.get('activity_confidence', 'KEY_NOT_FOUND')}")
                 else:  # Unknown face - save snapshot and persist to database / analytics
-                    if not self.enable_unknown_face_tracking and not runtime_config.get("enable_activity", self.enable_activity_detection):
-                        continue
-
                     # Save cropped face snapshot; retry once if save fails
                     snapshot_path = self._save_unknown_face_snapshot(face_crop, camera_id)
                     if snapshot_path is None:
@@ -755,6 +816,23 @@ class CCTVRecognitionEngine:
                         face_crop_retry = self._crop_face(prepared_frame, face_bbox)
                         if face_crop_retry is not None:
                             snapshot_path = self._save_unknown_face_snapshot(face_crop_retry, camera_id)
+                    predicted_debug = (match or {}).get("recognition_debug") or {}
+                    review_snapshot_path = self._save_review_snapshot(
+                        face_crop,
+                        camera_id,
+                        predicted_debug.get("predicted_name"),
+                        predicted_debug.get("predicted_profile_id"),
+                    )
+                    review_candidate = self._build_review_candidate(
+                        camera_id=camera_id,
+                        camera_name=runtime_config.get("camera_name", camera_id),
+                        recognition_debug=predicted_debug,
+                        snapshot_path=review_snapshot_path,
+                    )
+                    self.upsert_recognition_review_candidate(review_candidate)
+
+                    if not self.enable_unknown_face_tracking and not runtime_config.get("enable_activity", self.enable_activity_detection):
+                        continue
                     
                     # MATCH UNKNOWN FACE by position (same person stays in ~same location)
                     # Using position-based tracking instead of embedding for reliability
@@ -832,6 +910,13 @@ class CCTVRecognitionEngine:
                         'activity_confidence': activity_confidence,
                         'embedding_similarity': None,  # Will be set if matched to existing person
                         'recognition_debug': recognition_debug,
+                        'quality_band': recognition_debug.get("quality_band"),
+                        'quality_score': recognition_debug.get("quality_score"),
+                        'face_size_px': recognition_debug.get("face_size_px"),
+                        'preprocess_variant': recognition_debug.get("preprocess_variant"),
+                        'recovery_stage': recognition_debug.get("recovery_stage"),
+                        'temporal_consensus': recognition_debug.get("temporal_consensus", 0.0),
+                        'decision_reason': recognition_debug.get("decision_reason"),
                         'ready_for_persistence': bool(should_persist_unknown and unknown_state.get("snapshot_path")),
                         'frame_path': unknown_state.get("snapshot_path") if should_persist_unknown else None,
                         **flattened_emotion,
@@ -856,7 +941,7 @@ class CCTVRecognitionEngine:
             
             # Update current detections
             self.current_detections[camera_id] = {
-                'updated_at': datetime.now().isoformat(),
+                'updated_at': app_now().isoformat(),
                 'known_faces': known_faces,
                 'unknown_faces': unknown_faces,
                 'total_faces': len(known_faces) + len(unknown_faces)
@@ -886,7 +971,7 @@ class CCTVRecognitionEngine:
                     frame=prepared_frame,
                     detections=class_activity_inputs,
                     runtime_config=runtime_config,
-                    timestamp=datetime.utcnow(),
+                    timestamp=app_now(),
                 )
                 if class_activity:
                     self.latest_class_activity[camera_id] = class_activity
@@ -1039,8 +1124,68 @@ class CCTVRecognitionEngine:
                         int(bbox[3]),
                     ]
         return detections
+
+    def _recognition_track_key(self, camera_id, face_bbox, profile_id=None):
+        if profile_id is not None:
+            return f"{camera_id}:profile:{profile_id}"
+        if len(face_bbox or []) >= 4:
+            x, y, w, h = [int(v) for v in face_bbox[:4]]
+            return f"{camera_id}:bbox:{x//20}:{y//20}:{w//10}:{h//10}"
+        return f"{camera_id}:unknown"
+
+    def _apply_temporal_recognition_fusion(self, result, face_bbox, camera_id, runtime_config):
+        recognition_debug = dict((result or {}).get("recognition_debug") or {})
+        track_key = self._recognition_track_key(camera_id, face_bbox, result.get("profile_id"))
+        history = self.recognition_temporal_history[track_key]
+        history.append(
+            {
+                "profile_id": result.get("profile_id"),
+                "name": result.get("name"),
+                "recognized": bool(result.get("recognized")),
+                "confidence": float(result.get("confidence") or 0.0),
+                "score_gap": float(recognition_debug.get("score_gap") or 0.0),
+                "quality_band": recognition_debug.get("quality_band"),
+                "decision_reason": recognition_debug.get("decision_reason"),
+            }
+        )
+
+        consensus_frames_required = int(runtime_config.get("consensus_frames_required", self.default_consensus_frames_required))
+        recognized_items = [item for item in history if item.get("recognized") and item.get("profile_id") is not None]
+        candidates = defaultdict(int)
+        for item in recognized_items:
+            candidates[item["profile_id"]] += 1
+        consensus_count = max(candidates.values()) if candidates else 0
+        consensus_ratio = (consensus_count / len(recognized_items)) if recognized_items else 0.0
+
+        recognition_debug["temporal_consensus"] = round(consensus_ratio, 4)
+        recognition_debug["consensus_frames_required"] = consensus_frames_required
+        result["temporal_consensus"] = round(consensus_ratio, 4)
+
+        weak_quality = recognition_debug.get("quality_band") in {"weak", "too_small"}
+        borderline_confidence = float(result.get("confidence") or 0.0) < float(
+            recognition_debug.get("applied_threshold") or self.ai_engine.recognition_threshold
+        )
+        if result.get("recognized") and (weak_quality or borderline_confidence):
+            if consensus_count < consensus_frames_required:
+                result.update(
+                    {
+                        "recognized": False,
+                        "profile_id": None,
+                        "name": "Unknown",
+                        "confidence": 0.0,
+                    }
+                )
+                recognition_debug["recognition_rejection_reason"] = "temporal_consensus"
+                recognition_debug["decision_reason"] = "awaiting_temporal_consensus"
+            else:
+                recognition_debug["decision_reason"] = "identity_weak_but_recovered"
+
+        result["recognition_debug"] = recognition_debug
+        result["identity_decision_reason"] = recognition_debug.get("decision_reason")
+        result["decision_reason"] = recognition_debug.get("decision_reason")
+        return result
     
-    def _recognize_face(self, face_image, original_frame, face_bbox, landmarks=None, is_cropped=True, face_obj=None, camera_id=None, enable_emotion=None, enable_activity=None):
+    def _recognize_face(self, face_image, original_frame, face_bbox, landmarks=None, is_cropped=True, face_obj=None, camera_id=None, enable_emotion=None, enable_activity=None, runtime_config=None):
         """
         Recognize a face using the ChronoEngine.
         Optional emotion detection runs in parallel without blocking attendance.
@@ -1060,6 +1205,7 @@ class CCTVRecognitionEngine:
                   or None if no match
         """
         try:
+            runtime_config = runtime_config or {}
             # Create appropriate bbox for recognition
             if is_cropped:
                 # For cropped images, use the full image as the face region
@@ -1085,7 +1231,7 @@ class CCTVRecognitionEngine:
             
             # Check if it's a valid match (not 'Unknown')
             if profile_id is None or name == 'Unknown':
-                return {
+                result = {
                     "recognized": False,
                     "profile_id": None,
                     "name": "Unknown",
@@ -1098,7 +1244,15 @@ class CCTVRecognitionEngine:
                     "applied_min_gap": recognition_debug.get("applied_min_gap"),
                     "matched_view": recognition_debug.get("matched_view"),
                     "recognition_rejection_reason": recognition_debug.get("recognition_rejection_reason"),
+                    "quality_band": recognition_debug.get("quality_band"),
+                    "quality_score": recognition_debug.get("quality_score"),
+                    "face_size_px": recognition_debug.get("face_size_px"),
+                    "preprocess_variant": recognition_debug.get("preprocess_variant"),
+                    "recovery_stage": recognition_debug.get("recovery_stage"),
+                    "identity_decision_reason": recognition_debug.get("decision_reason"),
+                    "decision_reason": recognition_debug.get("decision_reason"),
                 }
+                return self._apply_temporal_recognition_fusion(result, face_bbox, camera_id, runtime_config)
             
             result = {
                 'recognized': True,
@@ -1113,6 +1267,20 @@ class CCTVRecognitionEngine:
                 'applied_min_gap': recognition_debug.get("applied_min_gap"),
                 'matched_view': recognition_debug.get("matched_view"),
                 'recognition_rejection_reason': recognition_debug.get("recognition_rejection_reason"),
+                'quality_band': recognition_debug.get("quality_band"),
+                'quality_score': recognition_debug.get("quality_score"),
+                'face_size_px': recognition_debug.get("face_size_px"),
+                'blur_score': recognition_debug.get("blur_score"),
+                'brightness': recognition_debug.get("brightness"),
+                'contrast': recognition_debug.get("contrast"),
+                'yaw': recognition_debug.get("yaw"),
+                'pitch': recognition_debug.get("pitch"),
+                'roll': recognition_debug.get("roll"),
+                'occlusion_risk': recognition_debug.get("occlusion_risk"),
+                'preprocess_variant': recognition_debug.get("preprocess_variant"),
+                'recovery_stage': recognition_debug.get("recovery_stage"),
+                'identity_decision_reason': recognition_debug.get("decision_reason"),
+                'decision_reason': recognition_debug.get("decision_reason"),
             }
             if self.profile_db is not None:
                 profile = self.profile_db.get_profile(profile_id)
@@ -1121,6 +1289,10 @@ class CCTVRecognitionEngine:
                     result["class_name"] = profile.get("class_name")
                     result["section_name"] = profile.get("section_name")
             
+            result = self._apply_temporal_recognition_fusion(result, face_bbox, camera_id, runtime_config)
+            if not result.get("recognized"):
+                return result
+
             # EMOTION DETECTION - Optional, doesn't block attendance
             # Uses isolated cropped face for better detection
             if enable_emotion is None:
@@ -1141,7 +1313,8 @@ class CCTVRecognitionEngine:
                 emotion_detector_ready and not emotion_model_loaded
             )
 
-            if enable_emotion and emotion_detector_ready and min(h_e, w_e) >= self.min_emotion_face_size:
+            min_face_size_emotion = int(runtime_config.get("min_face_size_emotion", self.min_emotion_face_size))
+            if enable_emotion and emotion_detector_ready:
                 try:
                     emotion_data = self._infer_emotion_signal(
                         face_crop=frame_for_emotion,
@@ -1150,6 +1323,7 @@ class CCTVRecognitionEngine:
                         camera_key=camera_id,
                         track_key=f"{camera_id}:profile:{profile_id}",
                         enable_emotion=enable_emotion,
+                        min_face_size_emotion=min_face_size_emotion,
                     )
                     result.update(emotion_data or {})
                     logger.info(
@@ -1170,6 +1344,7 @@ class CCTVRecognitionEngine:
                     result['emotion_unavailable_reason'] = getattr(self.emotion_pipeline.backend, "last_error", None) or 'emotion_model_unavailable'
                 else:
                     result['emotion_unavailable_reason'] = 'face_too_small_for_emotion'
+                result['emotion_status_reason'] = result.get('emotion_unavailable_reason')
             
             # ACTIVITY DETECTION - Optional, doesn't block attendance
             # Uses full frame + face bbox for comprehensive activity analysis
@@ -1201,9 +1376,9 @@ class CCTVRecognitionEngine:
             "emotion_confidence": 0.0,
             "emotion_intensity": "low",
             "all_emotions": {},
-            "raw_emotion": LOW_SIGNAL_EMOTION,
+            "raw_emotion": "Neutral",
             "raw_confidence": 0.0,
-            "smoothed_emotion": "LowSignal",
+            "smoothed_emotion": "Neutral",
             "smoothed_confidence": 0.0,
             "derived_emotion": "Passive",
             "educational_state": "Waiting",
@@ -1226,6 +1401,15 @@ class CCTVRecognitionEngine:
             "low_signal_state": True,
             "emotion_unavailable_reason": reason,
             "legacy_emotion_source": "low_signal",
+            "quality_band": "too_small",
+            "face_size_px": 0,
+            "preprocess_variant": None,
+            "recovery_stage": None,
+            "temporal_consensus": 0.0,
+            "identity_decision_reason": reason,
+            "emotion_status_reason": reason,
+            "decision_reason": reason,
+            "weak_match_threshold": 0.0,
         }
 
     def _infer_emotion_signal(
@@ -1236,6 +1420,7 @@ class CCTVRecognitionEngine:
         camera_key,
         track_key,
         enable_emotion,
+        min_face_size_emotion=None,
         activity=None,
         activity_confidence=0.0,
         face_obj=None,
@@ -1251,6 +1436,13 @@ class CCTVRecognitionEngine:
             return result
 
         prepared_face_crop = self._prepare_face_crop_for_emotion(face_crop)
+        prepared_face_size = int(min(prepared_face_crop.shape[:2]))
+        min_face_size_emotion = int(min_face_size_emotion or self.min_emotion_face_size)
+        if prepared_face_size < min_face_size_emotion:
+            result = self._default_emotion_result("unavailable", "face_too_small_for_emotion")
+            result["face_size"] = original_face_size
+            result["emotion_input_face_size"] = prepared_face_size
+            return result
 
         detection_confidence = 1.0
         if face_obj is not None:
@@ -1261,7 +1453,7 @@ class CCTVRecognitionEngine:
             landmarks=landmarks,
             detection_confidence=detection_confidence,
             track_key=str(track_key),
-            timestamp=datetime.utcnow(),
+            timestamp=app_now(),
             activity=activity,
             activity_confidence=activity_confidence,
         )
@@ -1273,7 +1465,7 @@ class CCTVRecognitionEngine:
         emotion_data["emotion_model_name"] = getattr(self.emotion_pipeline.backend, "model_name", None)
         emotion_data["emotion_model_version"] = getattr(self.emotion_pipeline.backend, "model_version", None)
         if emotion_data.get("emotion_available"):
-            self.last_emotion_detection_at[camera_key] = datetime.utcnow().isoformat()
+            self.last_emotion_detection_at[camera_key] = app_now().isoformat()
             self.emotion_detection_error[camera_key] = None
         elif emotion_data.get("emotion_unavailable_reason"):
             self.emotion_detection_error[camera_key] = emotion_data.get("emotion_unavailable_reason")
@@ -1353,6 +1545,15 @@ class CCTVRecognitionEngine:
     def _camera_snapshot_dir(self, camera_id):
         return os.path.join(self.snapshots_dir, f'camera_{camera_id}')
 
+    def _review_snapshot_exists(self, camera_id, filename):
+        if camera_id is None or not filename:
+            return False
+        try:
+            filepath = os.path.join(self._camera_snapshot_dir(camera_id), str(filename))
+            return os.path.isfile(filepath)
+        except Exception:
+            return False
+
     def _sanitize_snapshot_token(self, value):
         normalized = re.sub(r'[^A-Za-z0-9._-]+', '_', str(value or '').strip())
         return normalized.strip('._') or "person"
@@ -1405,6 +1606,7 @@ class CCTVRecognitionEngine:
         """Keep snapshots for 24h, cap unknown captures at 20, and clear stale references."""
         camera_dir = self._camera_snapshot_dir(camera_id)
         deleted_recognized = []
+        deleted_review = []
 
         if not os.path.exists(camera_dir):
             return
@@ -1422,6 +1624,8 @@ class CCTVRecognitionEngine:
                         os.remove(filepath)
                         if filename.startswith('recognized_'):
                             deleted_recognized.append(filename)
+                        elif filename.startswith('review_'):
+                            deleted_review.append(filename)
                 except FileNotFoundError:
                     continue
 
@@ -1447,12 +1651,16 @@ class CCTVRecognitionEngine:
 
             if deleted_recognized:
                 self.attendance_tracker.clear_frame_path_references(deleted_recognized)
+            if deleted_review:
+                self._recognition_review_collection().delete_many(
+                    {"camera_id": camera_id, "snapshot_path": {"$in": deleted_review}}
+                )
         except Exception as e:
             logger.warning(f"Snapshot cleanup failed for camera {camera_id}: {e}")
     
     def _save_unknown_face_snapshot(self, face_crop, camera_id):
         """
-        Save unknown face snapshot to disk (cropped face only).
+        Save unknown face snapshot to disk using the enhanced crop shown to operators.
         
         Args:
             face_crop: Cropped face image (just the detected face region with minimal padding)
@@ -1465,13 +1673,19 @@ class CCTVRecognitionEngine:
             self._cleanup_snapshot_retention(camera_id)
             camera_dir = self._camera_snapshot_dir(camera_id)
             os.makedirs(camera_dir, exist_ok=True)
+
+            snapshot_image = face_crop
+            try:
+                snapshot_image = self._prepare_face_crop_for_emotion(face_crop)
+            except Exception as exc:
+                logger.debug(f"Unknown-face snapshot enhancement failed, using original crop: {exc}")
             
             # Generate filename with timestamp
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]  # Include milliseconds
+            timestamp = app_now().strftime('%Y%m%d_%H%M%S_%f')[:-3]  # Include milliseconds
             filename = f'unknown_face_{timestamp}.jpg'
             filepath = os.path.join(camera_dir, filename)
             
-            if not self._write_snapshot_atomic(face_crop, filepath):
+            if not self._write_snapshot_atomic(snapshot_image, filepath):
                 return None
 
             self._cleanup_snapshot_retention(camera_id)
@@ -1509,6 +1723,32 @@ class CCTVRecognitionEngine:
             return filename
         except Exception as e:
             logger.error(f"Failed to save recognized face snapshot: {e}")
+            return None
+
+    def _save_review_snapshot(self, face_crop, camera_id, predicted_name, predicted_profile_id=None):
+        """
+        Save a stable snapshot specifically for threshold review records.
+        These files are not part of the unknown-face rolling cap, so the review
+        table does not point at files that get deleted during normal cleanup.
+        """
+        try:
+            self._cleanup_snapshot_retention(camera_id)
+            camera_dir = self._camera_snapshot_dir(camera_id)
+            os.makedirs(camera_dir, exist_ok=True)
+
+            safe_name = self._sanitize_snapshot_token(predicted_name or "review")
+            identifier = self._sanitize_snapshot_token(
+                predicted_profile_id if predicted_profile_id is not None else predicted_name or "review"
+            )
+            filename = f"review_{identifier}_{safe_name}.jpg"
+            filepath = os.path.join(camera_dir, filename)
+
+            if not self._write_snapshot_atomic(face_crop, filepath):
+                return None
+
+            return filename
+        except Exception as e:
+            logger.error(f"Failed to save review snapshot: {e}")
             return None
     
     def get_current_detections(self, camera_id):
@@ -2089,9 +2329,207 @@ class CCTVRecognitionEngine:
                     'confidence': doc.get("confidence"),
                     'emotion': doc.get("emotion"),
                     'timestamp': doc.get("timestamp"),
+                    'location': doc.get("location"),
+                    'quality_band': doc.get("quality_band"),
+                    'face_size_px': doc.get("face_size_px"),
+                    'preprocess_variant': doc.get("preprocess_variant"),
+                    'recovery_stage': doc.get("recovery_stage"),
+                    'temporal_consensus': doc.get("temporal_consensus"),
+                    'decision_reason': doc.get("decision_reason"),
                 }
                 for doc in cursor
             ]
         except Exception as e:
             logger.error(f"Failed to get recognition logs: {e}")
             return []
+
+    def _recognition_review_collection(self):
+        return mongo_store.collection("recognition_review")
+
+    def _normalize_review_doc(self, doc):
+        if not doc:
+            return None
+        snapshot_path = doc.get("snapshot_path")
+        camera_id = doc.get("camera_id")
+        snapshot_url = None
+        if camera_id is not None and snapshot_path and self._review_snapshot_exists(camera_id, snapshot_path):
+            snapshot_url = f"/api/snapshots/{camera_id}/{quote(str(snapshot_path), safe='')}"
+        return {
+            "id": doc.get("_id"),
+            "camera_id": camera_id,
+            "camera_name": doc.get("camera_name"),
+            "predicted_profile_id": doc.get("predicted_profile_id"),
+            "predicted_name": doc.get("predicted_name"),
+            "top1_score": float(doc.get("top1_score") or 0.0),
+            "top2_name": doc.get("top2_name"),
+            "top2_score": float(doc.get("top2_score") or 0.0),
+            "top3_name": doc.get("top3_name"),
+            "top3_score": float(doc.get("top3_score") or 0.0),
+            "applied_threshold": float(doc.get("applied_threshold") or 0.0),
+            "score_gap": float(doc.get("score_gap") or 0.0),
+            "matched_view": doc.get("matched_view"),
+            "snapshot_path": snapshot_path,
+            "snapshot_url": snapshot_url,
+            "first_seen_at": doc.get("first_seen_at"),
+            "last_seen_at": doc.get("last_seen_at"),
+            "detection_count": int(doc.get("detection_count") or 0),
+            "review_status": doc.get("review_status") or "unreviewed",
+            "review_note": doc.get("review_note") or "",
+        }
+
+    def _build_review_candidate(self, camera_id, camera_name, recognition_debug, snapshot_path):
+        predicted_profile_id = recognition_debug.get("predicted_profile_id")
+        predicted_name = recognition_debug.get("predicted_name")
+        top_candidates = list(recognition_debug.get("top_candidates") or [])
+        if predicted_profile_id in (None, -1) or not predicted_name or not top_candidates or not snapshot_path:
+            return None
+
+        top1 = top_candidates[0] if len(top_candidates) >= 1 else {}
+        top2 = top_candidates[1] if len(top_candidates) >= 2 else {}
+        top3 = top_candidates[2] if len(top_candidates) >= 3 else {}
+        return {
+            "camera_id": camera_id,
+            "camera_name": camera_name,
+            "predicted_profile_id": predicted_profile_id,
+            "predicted_name": predicted_name,
+            "top1_score": float(recognition_debug.get("best_score") or top1.get("score") or 0.0),
+            "top2_name": top2.get("name"),
+            "top2_score": float(top2.get("score") or 0.0),
+            "top3_name": top3.get("name"),
+            "top3_score": float(top3.get("score") or 0.0),
+            "applied_threshold": float(recognition_debug.get("applied_threshold") or 0.0),
+            "score_gap": float(recognition_debug.get("score_gap") or 0.0),
+            "matched_view": recognition_debug.get("matched_view"),
+            "snapshot_path": snapshot_path,
+        }
+
+    def upsert_recognition_review_candidate(self, candidate):
+        if not candidate:
+            return None
+        try:
+            now = app_now()
+            existing = self._recognition_review_collection().find_one(
+                {
+                    "camera_id": candidate["camera_id"],
+                    "predicted_profile_id": candidate["predicted_profile_id"],
+                }
+            )
+
+            if not existing:
+                record = {
+                    "_id": mongo_store.next_id("recognition_review"),
+                    **candidate,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "detection_count": 1,
+                    "review_status": "unreviewed",
+                    "review_note": "",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                self._recognition_review_collection().insert_one(record)
+                return self._normalize_review_doc(record)
+
+            updates = {
+                "last_seen_at": now,
+                "updated_at": now,
+            }
+            increments = {"detection_count": 1}
+
+            if float(candidate.get("top1_score") or 0.0) > float(existing.get("top1_score") or 0.0):
+                updates.update(candidate)
+
+            self._recognition_review_collection().update_one(
+                {"_id": existing["_id"]},
+                {"$set": updates, "$inc": increments},
+            )
+            refreshed = self._recognition_review_collection().find_one({"_id": existing["_id"]})
+            return self._normalize_review_doc(refreshed)
+        except Exception as exc:
+            logger.error(f"Failed to upsert recognition review candidate: {exc}")
+            return None
+
+    def list_recognition_review_records(self, camera_id=None, review_status=None, predicted_profile_id=None, limit=200, sort="top_score_desc"):
+        try:
+            query = {}
+            if camera_id is not None:
+                query["camera_id"] = camera_id
+            if review_status:
+                query["review_status"] = review_status
+            if predicted_profile_id is not None:
+                query["predicted_profile_id"] = predicted_profile_id
+
+            sort_spec = [("top1_score", -1)]
+            if sort == "recent":
+                sort_spec = [("last_seen_at", -1)]
+
+            cursor = self._recognition_review_collection().find(query).sort(sort_spec).limit(max(1, int(limit or 200)))
+            return [self._normalize_review_doc(doc) for doc in cursor]
+        except Exception as exc:
+            logger.error(f"Failed to list recognition review records: {exc}")
+            return []
+
+    def update_recognition_review_verdict(self, record_id, review_status, note=""):
+        if review_status not in {"correct", "incorrect", "unreviewed"}:
+            return None
+        try:
+            self._recognition_review_collection().update_one(
+                {"_id": record_id},
+                {
+                    "$set": {
+                        "review_status": review_status,
+                        "review_note": str(note or "").strip(),
+                        "updated_at": app_now(),
+                    }
+                },
+            )
+            return self._normalize_review_doc(self._recognition_review_collection().find_one({"_id": record_id}))
+        except Exception as exc:
+            logger.error(f"Failed to update recognition review verdict: {exc}")
+            return None
+
+    def export_recognition_review_csv(self, camera_id=None, review_status=None, predicted_profile_id=None, limit=5000, sort="top_score_desc"):
+        rows = self.list_recognition_review_records(
+            camera_id=camera_id,
+            review_status=review_status,
+            predicted_profile_id=predicted_profile_id,
+            limit=limit,
+            sort=sort,
+        )
+        buffer = io.StringIO()
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=[
+                "camera_id",
+                "camera_name",
+                "predicted_profile_id",
+                "predicted_name",
+                "top1_score",
+                "top2_name",
+                "top2_score",
+                "top3_name",
+                "top3_score",
+                "applied_threshold",
+                "score_gap",
+                "matched_view",
+                "first_seen_at",
+                "last_seen_at",
+                "detection_count",
+                "snapshot_path",
+                "snapshot_url",
+                "review_status",
+                "review_note",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+        return buffer.getvalue()
+
+    def reset_recognition_review_records(self, camera_id=None):
+        try:
+            query = {"camera_id": camera_id} if camera_id is not None else {}
+            result = self._recognition_review_collection().delete_many(query)
+            return int(result.deleted_count or 0)
+        except Exception as exc:
+            logger.error(f"Failed to reset recognition review records: {exc}")
+            return 0

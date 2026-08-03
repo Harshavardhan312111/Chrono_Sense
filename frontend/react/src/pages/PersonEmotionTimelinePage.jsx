@@ -13,6 +13,33 @@ function formatEmotionScores(scores) {
     .join(", ");
 }
 
+function getDisplayedEmotion(event) {
+  if (event?.smoothed_emotion && event.smoothed_emotion !== "LowSignal") {
+    return event.smoothed_emotion;
+  }
+  if (event?.raw_emotion && event.raw_emotion !== "LowSignal") {
+    return `${event.raw_emotion} (raw)`;
+  }
+  if ((event?.emotion || event?.raw_emotion || event?.smoothed_emotion) === "LowSignal") {
+    return "Neutral";
+  }
+  return event?.emotion || event?.raw_emotion || "Neutral";
+}
+
+function getDisplayedEmotionScores(event) {
+  if (event?.smoothed_emotion && event.smoothed_emotion !== "LowSignal") {
+    return event.smoothed_scores || event.raw_scores || event.all_emotions;
+  }
+  return event?.raw_scores || event?.all_emotions || event?.smoothed_scores;
+}
+
+function getDisplayedEmotionConfidence(event) {
+  if (event?.smoothed_emotion && event.smoothed_emotion !== "LowSignal") {
+    return Number(event?.emotion_confidence || event?.smoothed_confidence || 0);
+  }
+  return Number(event?.raw_confidence || event?.emotion_confidence || 0);
+}
+
 export function PersonEmotionTimelinePage() {
   const { profileId } = useParams();
   const [startDate, setStartDate] = useState(getWeekStartDateInputValue());
@@ -160,9 +187,9 @@ export function PersonEmotionTimelinePage() {
               {!loading ? timeline.map((event) => (
                 <tr key={`${event.timestamp}-${event.emotion}`}>
                   <td>{event.timestamp || "-"}</td>
-                  <td>{event.emotion || "-"}</td>
-                  <td>{formatEmotionScores(event.smoothed_scores || event.raw_scores || event.all_emotions) || "-"}</td>
-                  <td>{Math.round((event.emotion_confidence || 0) * 100)}%</td>
+                  <td>{getDisplayedEmotion(event)}</td>
+                  <td>{formatEmotionScores(getDisplayedEmotionScores(event)) || "-"}</td>
+                  <td>{Math.round(getDisplayedEmotionConfidence(event) * 100)}%</td>
                   <td>{Math.round((event.recognition_confidence || 0) * 100)}%</td>
                   <td>{event.location || "-"}</td>
                 </tr>

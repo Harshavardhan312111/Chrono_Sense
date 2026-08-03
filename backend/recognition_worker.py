@@ -129,8 +129,12 @@ class RecognitionWorker:
         desired_doc = desired_map.get(camera_id) or {}
         desired = bool(desired_doc.get("desired_running", False))
         desired_mode = desired_doc.get("mode", "attendance")
+        requested_by = desired_doc.get("requested_by")
         current = self.recognition_engine.get_recognition_status(camera_id)
         is_running = bool(current.get("is_running"))
+        processing_enabled = bool(camera.get("processing_enabled", True))
+        manual_override = requested_by in {"emotion_api", "api"}
+        operationally_allowed = bool(camera.get("enabled", True)) and (processing_enabled or manual_override)
 
         enable_emotion = desired_mode == "emotion" or bool(camera.get("enable_emotion"))
         self.recognition_engine.enable_emotion_detection = enable_emotion
@@ -155,20 +159,20 @@ class RecognitionWorker:
             )
             return
 
-        if camera.get("enabled", True) and desired and not is_running:
+        if operationally_allowed and desired and not is_running:
             logger.info(f"Starting worker recognition for camera {camera_id} ({camera['name']})")
             self.recognition_engine.start_recognition(camera_id)
-        elif (not camera.get("enabled", True) or not desired) and is_running:
+        elif (not operationally_allowed or not desired) and is_running:
             logger.info(f"Stopping worker recognition for camera {camera_id} ({camera['name']})")
             self.recognition_engine.stop_recognition(camera_id)
-        elif not camera.get("enabled", True) and not current.get("status"):
+        elif (not camera.get("enabled", True) or not processing_enabled) and not current.get("status"):
             set_runtime_state(
                 camera_id,
                 {
                     "camera_name": camera["name"],
                     "is_running": False,
-                    "status": "disabled",
-                    "message": "Camera disabled",
+                    "status": "disabled" if not camera.get("enabled", True) else "processing-disabled",
+                    "message": "Camera disabled" if not camera.get("enabled", True) else "Camera processing disabled",
                     "worker_id": self.worker_id,
                 },
             )

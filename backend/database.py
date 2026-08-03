@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import numpy as np
 
@@ -9,6 +9,10 @@ try:
     from mongo_store import mongo_store
 except ImportError:
     from backend.mongo_store import mongo_store
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 logger = logging.getLogger(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "mongo")
@@ -145,7 +149,7 @@ class ProfileDatabase:
                     "roll_number": roll_number,
                     "check_in_time": check_in_time,
                     "check_out_time": check_out_time,
-                    "created_at": datetime.utcnow(),
+                    "created_at": app_now(),
                     "image_path": image_path,
                     "profile_complete": bool(profile_complete),
                     "recognition_trained": bool(recognition_trained),
@@ -374,8 +378,8 @@ class ProfileDatabase:
                     "snapshot_path": snapshot_path,
                     "face_bbox": face_bbox if isinstance(face_bbox, list) else list(face_bbox or []),
                     "embedding": self._serialize_embedding(embedding) if embedding is not None else None,
-                    "first_seen": datetime.utcnow(),
-                    "last_seen": datetime.utcnow(),
+                    "first_seen": app_now(),
+                    "last_seen": app_now(),
                     "detection_count": 1,
                     "profile_id": profile_id,
                     }
@@ -405,7 +409,7 @@ class ProfileDatabase:
 
     def get_unknown_faces(self, camera_id, hours=24):
         try:
-            cutoff = datetime.utcnow() - timedelta(hours=hours)
+            cutoff = app_now() - timedelta(hours=hours)
             cursor = mongo_store.collection("unknown_faces").find(
                 {"camera_id": camera_id, "last_seen": {"$gt": cutoff}}
             ).sort("last_seen", -1)
@@ -431,7 +435,7 @@ class ProfileDatabase:
         try:
             result = mongo_store.collection("unknown_faces").update_one(
                 {"_id": unknown_face_id},
-                {"$inc": {"detection_count": 1}, "$set": {"last_seen": datetime.utcnow(), "profile_id": profile_id}},
+                {"$inc": {"detection_count": 1}, "$set": {"last_seen": app_now(), "profile_id": profile_id}},
             )
             return result.modified_count > 0
         except Exception as exc:
@@ -449,7 +453,7 @@ class ProfileDatabase:
     def cleanup_unknown_faces(self, camera_id, retention_hours=24, keep_latest=20):
         deleted_snapshot_paths = []
         try:
-            cutoff = datetime.utcnow() - timedelta(hours=retention_hours)
+            cutoff = app_now() - timedelta(hours=retention_hours)
             collection = mongo_store.collection("unknown_faces")
             expired = list(collection.find({"camera_id": camera_id, "last_seen": {"$lte": cutoff}}))
             if expired:

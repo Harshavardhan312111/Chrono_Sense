@@ -14,6 +14,10 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +122,7 @@ class ClassActivityPipeline:
         runtime_config: Dict,
         timestamp: Optional[datetime] = None,
     ) -> Optional[Dict]:
-        timestamp = timestamp or datetime.utcnow()
+        timestamp = timestamp or app_now()
         camera_context = (runtime_config.get("camera_context") or "mixed").strip().lower()
         if camera_context != "classroom":
             return None

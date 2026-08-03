@@ -13,7 +13,6 @@ import io
 import threading
 from datetime import datetime, timedelta
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 import pandas as pd
 from dotenv import load_dotenv
 from ai_engine import ChronoEngine
@@ -72,6 +71,10 @@ try:
 except ImportError:
     from backend.mongo_store import mongo_store
 try:
+    from time_utils import APP_TIMEZONE, UTC, app_now
+except ImportError:
+    from backend.time_utils import APP_TIMEZONE, UTC, app_now
+try:
     from recognition_runtime import (
         clear_camera_runtime,
         get_latest_detections as get_runtime_latest_detections,
@@ -90,14 +93,7 @@ except ImportError:
         set_desired_state,
     )
 
-APP_TIMEZONE = ZoneInfo("Asia/Kolkata")
-UTC = ZoneInfo("UTC")
-
 load_dotenv()
-
-
-def app_now():
-    return datetime.now(APP_TIMEZONE)
 
 def to_ist(utc_time_str):
     """Convert UTC timestamp to Asia/Kolkata format (HH:MM:SS)."""
@@ -303,7 +299,7 @@ def get_unknown_individual_count():
 
 def get_recent_unknown_counts_by_camera():
     using_mongo_runtime()
-    cutoff = datetime.utcnow() - timedelta(hours=24)
+    cutoff = app_now() - timedelta(hours=24)
     rows = mongo_store.collection("unknown_faces").aggregate([
         {"$match": {"last_seen": {"$gte": cutoff}}},
         {"$group": {"_id": "$camera_id", "count": {"$sum": 1}}}
@@ -656,7 +652,11 @@ def _build_overview_analytics(
 
 
 def get_enabled_camera_names():
-    return [camera["name"] for camera in cctv_manager.get_all_cameras() if camera.get("enabled")]
+    return [
+        camera["name"]
+        for camera in cctv_manager.get_all_cameras()
+        if camera.get("enabled") and camera.get("processing_enabled", True)
+    ]
 
 
 def get_camera_record(camera_id, enabled_only=False):
@@ -1240,7 +1240,7 @@ def iter_emotion_docs(collection_name, date=None, location=None, last_24_hours=F
             start, end = attendance_tracker._day_bounds(date)
             query["timestamp"] = {"$gte": start, "$lt": end}
         elif last_24_hours:
-            query["timestamp"] = {"$gte": datetime.utcnow() - timedelta(days=1)}
+            query["timestamp"] = {"$gte": app_now() - timedelta(days=1)}
         return list(mongo_store.collection(collection_name).find(query, {"location": 1, "emotion": 1, "timestamp": 1}))
 
 
@@ -1413,7 +1413,7 @@ async def extract_multi_view_embeddings(upload_map):
 
         view_embeddings[view_name] = {
             "embedding": embedding.astype(np.float32),
-            "captured_at": datetime.utcnow(),
+            "captured_at": app_now(),
             "image_path": None,
         }
 
@@ -1449,7 +1449,7 @@ def extract_multi_view_embeddings_from_images(image_map):
             continue
         view_embeddings[view_name] = {
             "embedding": embedding.astype(np.float32),
-            "captured_at": datetime.utcnow(),
+            "captured_at": app_now(),
             "image_path": None,
         }
     return view_embeddings, view_errors
@@ -1528,7 +1528,11 @@ def _stop_local_webcam_thread():
 
 def _build_attendance_marking_status():
     """Build combined attendance-marking status for enabled sources."""
-    enabled_cameras = [camera for camera in cctv_manager.get_all_cameras() if camera.get("enabled", True)]
+    enabled_cameras = [
+        camera
+        for camera in cctv_manager.get_all_cameras()
+        if camera.get("enabled", True) and camera.get("processing_enabled", True)
+    ]
     sources = []
     running_count = 0
 
@@ -1602,7 +1606,7 @@ def _get_live_recognition_worker_state():
         "emotion-worker",
         "activity-worker",
     )
-    now = datetime.utcnow()
+    now = app_now()
 
     for worker_id in candidate_worker_ids:
         try:
@@ -1978,7 +1982,7 @@ async def get_camera_status(authorization: str = Header(None)):
         
         return JSONResponse({
             'status': 'operational',
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': app_now().isoformat(),
             'camera_available': True,
             'backend': 'OpenCV',
             'cameras_enabled': camera_count,
@@ -2045,7 +2049,10 @@ async def get_operations_snapshot(
         attendance_data["marking_status"] = _build_attendance_marking_status()
 
         cameras = cctv_manager.get_all_cameras()
-        enabled_cameras = [camera for camera in cameras if camera.get("enabled")]
+        enabled_cameras = [
+            camera for camera in cameras
+            if camera.get("enabled") and camera.get("processing_enabled", True)
+        ]
         recognition_statuses = _get_all_runtime_recognition_status()
         recognition_map = {
             str(item.get("camera_id") or item.get("id")): item
@@ -2647,6 +2654,19 @@ def _annotate_frame(frame, result):
     
     return annotated
 
+
+def _encode_debug_image(image, jpeg_quality=82):
+    try:
+        import cv2
+
+        success, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        if not success:
+            return None
+        return base64.b64encode(buffer.tobytes()).decode("utf-8")
+    except Exception as exc:
+        logger.debug(f"Failed to encode debug image: {exc}")
+        return None
+
 @app.get("/video_feed")
 def video_feed():
     return StreamingResponse(generate_video_stream(), media_type="multipart/x-mixed-replace; boundary=frame")
@@ -2808,7 +2828,10 @@ async def get_attendance_dashboard_analytics(
 
         analytics["marking_status"] = _build_attendance_marking_status()
 
-        cameras = [camera for camera in cctv_manager.get_all_cameras() if camera.get("enabled", True)]
+        cameras = [
+            camera for camera in cctv_manager.get_all_cameras()
+            if camera.get("enabled", True) and camera.get("processing_enabled", True)
+        ]
         source_statuses = []
         for camera in cameras:
             camera_type = (camera.get("type") or "").upper()
@@ -2898,7 +2921,11 @@ async def start_attendance_marking(authorization: str = Header(None)):
         cctv_recognition_engine.enable_activity_detection = False
         cctv_recognition_engine.activity_detector = None
 
-        enabled_cameras = [camera for camera in cctv_manager.get_all_cameras() if camera.get("enabled", True)]
+        enabled_cameras = [
+            camera
+            for camera in cctv_manager.get_all_cameras()
+            if camera.get("enabled", True) and camera.get("processing_enabled", True)
+        ]
         if not enabled_cameras:
             return JSONResponse({"error": "No enabled cameras available."}, status_code=400)
 
@@ -2938,7 +2965,11 @@ async def stop_attendance_marking(authorization: str = Header(None)):
         if error:
             return error
 
-        enabled_cameras = [camera for camera in cctv_manager.get_all_cameras() if camera.get("enabled", True)]
+        enabled_cameras = [
+            camera
+            for camera in cctv_manager.get_all_cameras()
+            if camera.get("enabled", True) and camera.get("processing_enabled", True)
+        ]
         if not enabled_cameras:
             return JSONResponse({"error": "No enabled cameras available."}, status_code=400)
 
@@ -3055,11 +3086,11 @@ async def export_csv(date: str = None, start_date: str = None, end_date: str = N
     """Export attendance data as CSV."""
     if start_date or end_date:
         csv_data = attendance_tracker.export_attendance_summary_csv(start_date, end_date)
-        normalized_start = start_date or end_date or datetime.now().strftime('%Y-%m-%d')
+        normalized_start = start_date or end_date or app_now().strftime('%Y-%m-%d')
         normalized_end = end_date or start_date or normalized_start
         filename = f"attendance-report-{normalized_start}-to-{normalized_end}.csv"
     else:
-        normalized_date = date or datetime.now().strftime('%Y-%m-%d')
+        normalized_date = date or app_now().strftime('%Y-%m-%d')
         csv_data = attendance_tracker.export_attendance_csv(normalized_date)
         filename = f"attendance-report-{normalized_date}.csv"
 
@@ -3305,7 +3336,7 @@ async def get_student_emotion_timeline(
             if profile_id not in {profile["id"] for profile in scoped_profiles}:
                 return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = app_now().strftime("%Y-%m-%d")
         resolved_end = end_date or today
         resolved_start = start_date or resolved_end
         emotion_analytics = EmotionAnalytics(attendance_tracker.db_path)
@@ -3408,11 +3439,11 @@ async def log_emotion_detection(data: dict = Body(...)):
                     "$set": {
                         "name": name,
                         "emotion_confidence": emotion_confidence,
-                        "updated_at": datetime.utcnow(),
+                        "updated_at": app_now(),
                     },
                     "$setOnInsert": {
                         "_id": mongo_store.next_id("emotion_analytics"),
-                        "timestamp": datetime.utcnow(),
+                        "timestamp": app_now(),
                     },
                     "$inc": {"detection_count": 1},
                 },
@@ -3477,7 +3508,7 @@ async def get_classroom_emotions(location: str = None, date: str = None, authori
             'date': date,
             'locations': locations,
             'total_locations': len(locations),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': app_now().isoformat()
         }
     
     except Exception as e:
@@ -3516,7 +3547,7 @@ async def get_activities_by_location(date: str = None, authorization: str = Head
         camera_map = {
             camera["id"]: camera["name"]
             for camera in cctv_manager.get_all_cameras()
-            if camera.get("enabled")
+            if camera.get("enabled") and camera.get("processing_enabled", True)
         }
         
         # Use REAL-TIME detections from the recognition engine
@@ -3647,7 +3678,7 @@ async def get_activities_by_person(location: str = None, authorization: str = He
         return error
     
     try:
-        start_time = datetime.utcnow() - timedelta(days=1)
+        start_time = app_now() - timedelta(days=1)
         docs = iter_activity_docs(location=location, start_time=start_time, exclude_unknown=True)
         scope = user.get("scope") or get_user_scope(user)
         if scope.get("restricted"):
@@ -3794,7 +3825,7 @@ async def get_activity_timeline(location: str, hours: int = 24, authorization: s
         return error
     
     try:
-        start_time = datetime.utcnow() - timedelta(hours=hours)
+        start_time = app_now() - timedelta(hours=hours)
         docs = iter_activity_docs(location=location, start_time=start_time, exclude_unknown=True)
         timeline = {}
 
@@ -3874,7 +3905,7 @@ async def get_engagement_score(location: str, date: str = None, authorization: s
     
     try:
         if not date:
-            date = datetime.now().strftime('%Y-%m-%d')
+            date = app_now().strftime('%Y-%m-%d')
         
         # Define engagement levels
         high_engagement = ['Listening', 'Writing', 'Raised_Hand', 'Collaboration']
@@ -3986,9 +4017,9 @@ async def get_classroom_activities(location: str = None, date: str = None):
     """
     try:
         if not date:
-            date = datetime.now().strftime('%Y-%m-%d')
+            date = app_now().strftime('%Y-%m-%d')
         locations = {}
-        current_time = datetime.now().strftime('%H:%M:%S')
+        current_time = app_now().strftime('%H:%M:%S')
 
         if location:
             location_list = [location]
@@ -3997,7 +4028,11 @@ async def get_classroom_activities(location: str = None, date: str = None):
                 {
                     camera.get("name")
                     for camera in cctv_manager.get_all_cameras()
-                    if camera.get("enabled", True) and (camera.get("camera_context") or "").strip().lower() == "classroom"
+                    if (
+                        camera.get("enabled", True)
+                        and camera.get("processing_enabled", True)
+                        and (camera.get("camera_context") or "").strip().lower() == "classroom"
+                    )
                 }
             )
 
@@ -4109,7 +4144,7 @@ async def get_classroom_activity_timeline(location: str, hours: int = 24, author
     if error:
         return error
     try:
-        start_time = datetime.utcnow() - timedelta(hours=hours)
+        start_time = app_now() - timedelta(hours=hours)
         docs = iter_class_activity_docs(location=location, start_time=start_time)
         timeline = {}
         for doc in docs:
@@ -4155,7 +4190,7 @@ async def get_classroom_activity_summary(
         return error
     try:
         if not date:
-            date = datetime.now().strftime("%Y-%m-%d")
+            date = app_now().strftime("%Y-%m-%d")
         start, end = attendance_tracker._day_bounds(date)
         docs = iter_class_activity_docs(start_time=start, end_time=end, class_name=class_name, section_name=section_name)
         student_breakdown = {}
@@ -4229,6 +4264,10 @@ async def add_cctv_camera(camera_data: dict = Body(...), authorization: str = He
         inference_width = int(camera_data.get('inference_width', 960) or 960)
         target_fps = float(camera_data.get('target_fps', 8) or 8)
         recognition_threshold_override = camera_data.get('recognition_threshold_override')
+        min_face_size_identity = camera_data.get('min_face_size_identity')
+        min_face_size_emotion = camera_data.get('min_face_size_emotion')
+        weak_match_threshold = camera_data.get('weak_match_threshold')
+        consensus_frames_required = camera_data.get('consensus_frames_required')
         enable_emotion = camera_data.get('enable_emotion')
         enable_activity = camera_data.get('enable_activity')
         
@@ -4260,6 +4299,10 @@ async def add_cctv_camera(camera_data: dict = Body(...), authorization: str = He
             inference_width=inference_width,
             target_fps=target_fps,
             recognition_threshold_override=recognition_threshold_override,
+            min_face_size_identity=min_face_size_identity,
+            min_face_size_emotion=min_face_size_emotion,
+            weak_match_threshold=weak_match_threshold,
+            consensus_frames_required=consensus_frames_required,
             enable_emotion=enable_emotion,
             enable_activity=enable_activity,
             wing=wing,
@@ -4342,7 +4385,12 @@ async def get_all_cameras(authorization: str = Header(None)):
         formatted_cameras = []
         for cam in cameras:
             # Get latest status for this camera
-            status = 'disabled' if not cam['enabled'] else cctv_manager.get_camera_latest_status(cam['id'])
+            if not cam['enabled']:
+                status = 'disabled'
+            elif not cam.get('processing_enabled', True):
+                status = 'processing-disabled'
+            else:
+                status = cctv_manager.get_camera_latest_status(cam['id'])
             
             width, height = cam['resolution'] if isinstance(cam['resolution'], tuple) else (1280, 720)
             formatted_cameras.append({
@@ -4355,6 +4403,10 @@ async def get_all_cameras(authorization: str = Header(None)):
                 'inference_width': cam.get('inference_width', 960),
                 'target_fps': cam.get('target_fps', 8.0),
                 'recognition_threshold_override': cam.get('recognition_threshold_override'),
+                'min_face_size_identity': cam.get('min_face_size_identity'),
+                'min_face_size_emotion': cam.get('min_face_size_emotion'),
+                'weak_match_threshold': cam.get('weak_match_threshold'),
+                'consensus_frames_required': cam.get('consensus_frames_required'),
                 'enable_emotion': cam.get('enable_emotion'),
                 'enable_activity': cam.get('enable_activity'),
                 'wing': cam.get('wing'),
@@ -4369,6 +4421,7 @@ async def get_all_cameras(authorization: str = Header(None)):
                 'username': cam.get('username') if has_capability(user.get("role"), CAPABILITY_CAMERAS_MANAGE) else None,
                 'password': cam.get('password') if has_capability(user.get("role"), CAPABILITY_CAMERAS_MANAGE) else None,
                 'enabled': cam['enabled'],
+                'processing_enabled': cam.get('processing_enabled', True),
                 'status': status
             })
         
@@ -4477,6 +4530,47 @@ async def set_camera_enabled(camera_id: int, payload: dict = Body(...), authoriz
         logger.error(f"Error updating camera activation state: {str(e)}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
+@app.post("/api/cameras/{camera_id}/processing-enabled")
+async def set_camera_processing_enabled(camera_id: int, payload: dict = Body(...), authorization: str = Header(None)):
+    """Enable or disable a camera for attendance/emotion/activity processing only."""
+    try:
+        _user, error = require_capability_user(authorization, CAPABILITY_CAMERAS_MANAGE)
+        if error:
+            return error
+
+        cameras = cctv_manager.get_all_cameras()
+        camera = next((c for c in cameras if c['id'] == camera_id), None)
+        if not camera:
+            return JSONResponse({"error": "Camera not found"}, status_code=404)
+
+        processing_enabled = bool(payload.get("processing_enabled"))
+
+        if not processing_enabled:
+            try:
+                _request_recognition_state(camera_id, False, mode="attendance", requested_by="camera_processing_disable")
+            except Exception as stop_error:
+                logger.warning(
+                    f"Failed to queue stop for camera {camera_id} while disabling processing: {stop_error}"
+                )
+
+        success = cctv_manager.set_camera_processing_enabled(camera_id, processing_enabled)
+        if not success:
+            return JSONResponse({"error": "Failed to update camera processing state"}, status_code=500)
+
+        return {
+            "status": "success",
+            "camera_id": camera_id,
+            "processing_enabled": processing_enabled,
+            "message": (
+                "Camera processing enabled successfully"
+                if processing_enabled
+                else "Camera processing disabled successfully"
+            ),
+        }
+    except Exception as e:
+        logger.error(f"Error updating camera processing state: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 @app.put("/api/cameras/{camera_id}")
 async def update_camera(camera_id: int, camera_data: dict = Body(...), authorization: str = Header(None)):
     """Update camera details."""
@@ -4510,6 +4604,10 @@ async def update_camera(camera_id: int, camera_data: dict = Body(...), authoriza
         inference_width = int(camera_data.get('inference_width', 960) or 960)
         target_fps = float(camera_data.get('target_fps', 8) or 8)
         recognition_threshold_override = camera_data.get('recognition_threshold_override')
+        min_face_size_identity = camera_data.get('min_face_size_identity')
+        min_face_size_emotion = camera_data.get('min_face_size_emotion')
+        weak_match_threshold = camera_data.get('weak_match_threshold')
+        consensus_frames_required = camera_data.get('consensus_frames_required')
         enable_emotion = camera_data.get('enable_emotion')
         enable_activity = camera_data.get('enable_activity')
 
@@ -4537,6 +4635,10 @@ async def update_camera(camera_id: int, camera_data: dict = Body(...), authoriza
             inference_width=inference_width,
             target_fps=target_fps,
             recognition_threshold_override=recognition_threshold_override,
+            min_face_size_identity=min_face_size_identity,
+            min_face_size_emotion=min_face_size_emotion,
+            weak_match_threshold=weak_match_threshold,
+            consensus_frames_required=consensus_frames_required,
             enable_emotion=enable_emotion,
             enable_activity=enable_activity,
             wing=wing,
@@ -4858,7 +4960,10 @@ async def get_emotion_room_status(authorization: str = Header(None)):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
         runtime_map = {item.get("camera_id"): item for item in _get_all_runtime_recognition_status()}
-        cameras = [camera for camera in cctv_manager.get_all_cameras() if camera.get("enabled", True)]
+        cameras = [
+            camera for camera in cctv_manager.get_all_cameras()
+            if camera.get("enabled", True) and camera.get("processing_enabled", True)
+        ]
         rooms = []
 
         for camera in cameras:
@@ -4938,6 +5043,106 @@ async def get_recognition_logs(camera_id: int = None, limit: int = 100, authoriz
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/api/recognition/review")
+async def get_recognition_review_records(
+    camera_id: int = None,
+    review_status: str = None,
+    predicted_profile_id: int = None,
+    limit: int = 200,
+    sort: str = "top_score_desc",
+    authorization: str = Header(None),
+):
+    try:
+        _user, error = require_capability_user(authorization, CAPABILITY_RECOGNITION_VIEW)
+        if error:
+            return error
+
+        records = cctv_recognition_engine.list_recognition_review_records(
+            camera_id=camera_id,
+            review_status=review_status,
+            predicted_profile_id=predicted_profile_id,
+            limit=limit,
+            sort=sort,
+        )
+        return {"status": "success", "count": len(records), "records": records}
+    except Exception as e:
+        logger.error(f"Error getting recognition review records: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/recognition/review/{record_id}/verdict")
+async def update_recognition_review_verdict(
+    record_id: int,
+    payload: dict = Body(...),
+    authorization: str = Header(None),
+):
+    try:
+        _user, error = require_capability_user(authorization, CAPABILITY_RECOGNITION_MANAGE)
+        if error:
+            return error
+
+        review_status = str(payload.get("review_status") or "").strip().lower()
+        review_note = str(payload.get("note") or payload.get("review_note") or "").strip()
+        record = cctv_recognition_engine.update_recognition_review_verdict(
+            record_id,
+            review_status=review_status,
+            note=review_note,
+        )
+        if not record:
+            return JSONResponse({"error": "Recognition review record not found or invalid verdict."}, status_code=404)
+        return {"status": "success", "record": record}
+    except Exception as e:
+        logger.error(f"Error updating recognition review verdict: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/recognition/review/export.csv")
+async def export_recognition_review_csv(
+    camera_id: int = None,
+    review_status: str = None,
+    predicted_profile_id: int = None,
+    limit: int = 5000,
+    sort: str = "top_score_desc",
+    authorization: str = Header(None),
+):
+    try:
+        _user, error = require_capability_user(authorization, CAPABILITY_RECOGNITION_VIEW)
+        if error:
+            return error
+
+        csv_payload = cctv_recognition_engine.export_recognition_review_csv(
+            camera_id=camera_id,
+            review_status=review_status,
+            predicted_profile_id=predicted_profile_id,
+            limit=limit,
+            sort=sort,
+        )
+        filename = f"recognition-review-{app_now().strftime('%Y%m%d-%H%M%S')}.csv"
+        return StreamingResponse(
+            iter([csv_payload]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        logger.error(f"Error exporting recognition review csv: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/recognition/review/reset")
+async def reset_recognition_review_records(payload: dict = Body(default={}), authorization: str = Header(None)):
+    try:
+        _user, error = require_capability_user(authorization, CAPABILITY_RECOGNITION_MANAGE)
+        if error:
+            return error
+
+        camera_id = payload.get("camera_id")
+        deleted_count = cctv_recognition_engine.reset_recognition_review_records(camera_id=camera_id)
+        return {"status": "success", "deleted_count": deleted_count}
+    except Exception as e:
+        logger.error(f"Error resetting recognition review records: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/cameras/{camera_id}/detections")
 async def get_current_detections(camera_id: int, authorization: str = Header(None)):
     """Get current face detections (known + unknown) for a camera"""
@@ -4984,6 +5189,78 @@ async def get_current_detections(camera_id: int, authorization: str = Header(Non
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/api/cameras/{camera_id}/face-debug")
+async def get_camera_face_debug(camera_id: int, authorization: str = Header(None)):
+    """Capture a single frame and return raw face boxes plus cropped face images."""
+    try:
+        _user, error = require_capability_user(authorization, CAPABILITY_CAMERAS_VIEW)
+        if error:
+            return error
+
+        camera = get_camera_record(camera_id)
+        if not camera:
+            return JSONResponse({"error": "Camera not found"}, status_code=404)
+
+        if (camera.get("type") or "").upper() == "LOCAL_WEBCAM":
+            with _webcam_lock:
+                frame = _webcam_latest_frame.copy() if _webcam_latest_frame is not None else None
+            camera_name = camera.get("name") or "Local Webcam"
+        else:
+            cap, resolved_camera_name = cctv_recognition_engine._get_camera_stream(camera_id, max_retries=3)
+            try:
+                if cap is None or not cap.isOpened():
+                    return JSONResponse({"error": "Unable to open camera stream for face debug."}, status_code=503)
+                success, frame = cap.read()
+                if not success or frame is None:
+                    return JSONResponse({"error": "Unable to read a frame from the camera."}, status_code=503)
+            finally:
+                if cap is not None:
+                    cap.release()
+            camera_name = resolved_camera_name or camera.get("name") or f"Camera {camera_id}"
+
+        if frame is None:
+            return JSONResponse({"error": "No frame available for face debug."}, status_code=503)
+
+        import cv2
+
+        preview_width = 960
+        preview_height = 540
+        preview_frame = cv2.resize(frame, (preview_width, preview_height))
+        prepared_frame = cctv_recognition_engine._prepare_frame_for_inference(preview_frame)
+        face_candidates = cctv_recognition_engine.ai_engine.detect_faces_with_landmarks(prepared_frame) or []
+
+        face_debug = []
+        for index, face_data in enumerate(face_candidates):
+            bbox = list(face_data.get("bbox") or [])
+            if len(bbox) < 4:
+                continue
+
+            face_crop = cctv_recognition_engine._crop_face(prepared_frame, bbox)
+            encoded_crop = _encode_debug_image(face_crop) if face_crop is not None else None
+            x, y, w, h = [int(value) for value in bbox[:4]]
+            face_debug.append(
+                {
+                    "id": f"{camera_id}-{index + 1}",
+                    "bbox": [x, y, w, h],
+                    "label": f"Face {index + 1}",
+                    "size": {"width": w, "height": h},
+                    "crop_base64": encoded_crop,
+                }
+            )
+
+        return {
+            "status": "success",
+            "camera_id": camera_id,
+            "camera_name": camera_name,
+            "frame_size": {"width": preview_width, "height": preview_height},
+            "face_count": len(face_debug),
+            "faces": face_debug,
+        }
+    except Exception as e:
+        logger.error(f"Error getting camera face debug: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.post("/api/cameras/{camera_id}/emotion/start")
 async def start_emotion_detection(camera_id: int):
     """Start emotion detection on a camera - NO AUTHENTICATION REQUIRED for convenience"""
@@ -5022,7 +5299,11 @@ async def start_all_emotion_detection():
     try:
         cameras = [
             camera for camera in cctv_manager.get_all_cameras()
-            if camera.get("enabled") and (camera.get("type") or "").upper() != "LOCAL_WEBCAM"
+            if (
+                camera.get("enabled")
+                and camera.get("processing_enabled", True)
+                and (camera.get("type") or "").upper() != "LOCAL_WEBCAM"
+            )
         ]
         if not cameras:
             return JSONResponse({"error": "No enabled CCTV cameras found"}, status_code=404)
@@ -5204,7 +5485,7 @@ async def analyze_browser_camera_frame(
             "camera_id": scoped_camera_id or None,
             "camera_name": scoped_camera_name or None,
             "data": {
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": app_now().isoformat(),
                 "total_faces": len(detections),
                 "all_faces": [
                     _serialize_browser_detection(item)
@@ -5501,14 +5782,12 @@ async def get_snapshot(camera_id: int, filename: str):
 
 # ============ CCTV VIDEO STREAMING ENDPOINTS ============
 
-def generate_cctv_stream(camera_id):
-    """Generate MJPEG stream from CCTV camera with face detection overlays"""
-    import time
+def generate_cctv_stream(camera_id, roi_mode=None):
+    """Generate a lightweight MJPEG preview stream for connectivity checks."""
     try:
         import cv2
 
         preview_resolution = (960, 540)
-        preview_inference_every = 3
         jpeg_quality = 72
 
         def yield_status_frame(title, detail="", frames=30):
@@ -5586,9 +5865,6 @@ def generate_cctv_stream(camera_id):
         frame_count = 0
         error_count = 0
         max_errors = 15
-        cached_result = {'detections': []}
-        last_detection_log_at = 0.0
-        
         try:
             while True:
                 success, frame = cap.read()
@@ -5617,29 +5893,21 @@ def generate_cctv_stream(camera_id):
                 
                 error_count = 0
                 
+                if roi_mode == "emotion":
+                    try:
+                        if isinstance(camera_id, int):
+                            runtime_config = cctv_recognition_engine._get_camera_runtime_config(camera_id)
+                        else:
+                            runtime_config = {}
+                        cropped_frame, _ = cctv_recognition_engine._select_inference_region(frame, runtime_config)
+                        if cropped_frame is not None and getattr(cropped_frame, "size", 0):
+                            frame = cropped_frame
+                    except Exception as exc:
+                        logger.debug(f"Preview ROI selection failed for camera {camera_id}: {exc}")
+
                 # Resize once for preview to keep MJPEG throughput high.
                 frame_display = cv2.resize(frame, preview_resolution)
-
-                # Heavy detection runs only periodically; streamed frames reuse the latest result.
-                if frame_count == 1 or frame_count % preview_inference_every == 0:
-                    try:
-                        detections = cctv_recognition_engine.process_frame(frame_display, camera_id=camera_name)
-                        cached_result = {'detections': detections}
-
-                        now = time.time()
-                        if now - last_detection_log_at >= 2:
-                            logger.info(f"📊 Preview inference: {len(detections)} detections from {camera_name}")
-                            last_detection_log_at = now
-
-                        if detections:
-                            attendance_tracker.log_stream_detections(detections, location=camera_name)
-                    except Exception as e:
-                        logger.debug(f"Detection processing failed for {camera_name}: {e}")
-
-                try:
-                    annotated_frame = _annotate_frame(frame_display, cached_result)
-                except Exception:
-                    annotated_frame = frame_display
+                annotated_frame = frame_display
                 
                 # Add camera name and timestamp
                 cv2.putText(annotated_frame, camera_name, (10, 30),
@@ -5670,9 +5938,13 @@ def generate_cctv_stream(camera_id):
 
 
 @app.get("/api/cameras/{camera_id}/stream")
-async def stream_cctv_camera(camera_id: int):
+async def stream_cctv_camera(camera_id: int, roi: str = None):
     """Stream MJPEG video from CCTV camera"""
-    return StreamingResponse(generate_cctv_stream(camera_id), media_type="multipart/x-mixed-replace; boundary=frame")
+    roi_mode = (roi or "").strip().lower() or None
+    return StreamingResponse(
+        generate_cctv_stream(camera_id, roi_mode=roi_mode),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.get("/camera-stream.html")

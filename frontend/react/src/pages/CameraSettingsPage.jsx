@@ -5,6 +5,7 @@ import {
   addCamera,
   deleteCamera,
   getCameras,
+  setCameraProcessingEnabled,
   testCameraConnection,
   updateCamera
 } from "../lib/admin";
@@ -20,7 +21,11 @@ const initialForm = {
   username: "",
   password: "",
   fps: "30",
-  resolution: "1280x720"
+  resolution: "1280x720",
+  min_face_size_identity: "36",
+  min_face_size_emotion: "64",
+  weak_match_threshold: "0.26",
+  consensus_frames_required: "3"
 };
 
 function normalizeWingValue(form) {
@@ -186,7 +191,11 @@ export function CameraSettingsPage() {
       username: isLocalWebcamType(form.type) ? null : (form.username.trim() || null),
       password: isLocalWebcamType(form.type) ? null : (form.password.trim() || null),
       fps: Number(form.fps || 30),
-      resolution: form.resolution
+      resolution: form.resolution,
+      min_face_size_identity: Number(form.min_face_size_identity || 36),
+      min_face_size_emotion: Number(form.min_face_size_emotion || 64),
+      weak_match_threshold: Number(form.weak_match_threshold || 0.26),
+      consensus_frames_required: Number(form.consensus_frames_required || 3)
     };
 
     try {
@@ -219,7 +228,11 @@ export function CameraSettingsPage() {
       username: camera.username || "",
       password: camera.password || "",
       fps: String(camera.fps || 30),
-      resolution: camera.resolution || "1280x720"
+      resolution: camera.resolution || "1280x720",
+      min_face_size_identity: String(camera.min_face_size_identity || 36),
+      min_face_size_emotion: String(camera.min_face_size_emotion || 64),
+      weak_match_threshold: String(camera.weak_match_threshold || 0.26),
+      consensus_frames_required: String(camera.consensus_frames_required || 3)
     });
     setMessage(`Editing "${camera.name}".`);
   }
@@ -291,6 +304,32 @@ export function CameraSettingsPage() {
       setMessage(error.message || `Unable to connect to "${camera.name}".`);
     } finally {
       setTestingCameraId(null);
+    }
+  }
+
+  async function handleToggleProcessing(camera) {
+    const nextValue = !camera.processing_enabled;
+    setMessage(`${nextValue ? "Enabling" : "Disabling"} processing for "${camera.name}"...`);
+
+    try {
+      const result = await setCameraProcessingEnabled(camera.id, nextValue);
+      setCameras((current) =>
+        current.map((item) =>
+          item.id === camera.id
+            ? {
+                ...item,
+                processing_enabled: nextValue,
+                status: nextValue ? item.status : "processing-disabled"
+              }
+            : item
+        )
+      );
+      setMessage(
+        result.message ||
+          `Processing ${nextValue ? "enabled" : "disabled"} for "${camera.name}".`
+      );
+    } catch (error) {
+      setMessage(error.message || "Unable to update camera processing state.");
     }
   }
 
@@ -377,7 +416,24 @@ export function CameraSettingsPage() {
                 <option value="640x480">640x480</option>
                 <option value="1280x720">1280x720</option>
                 <option value="1920x1080">1920x1080</option>
+                <option value="2560x1440">2560x1440</option>
               </select>
+            </label>
+            <label className="filter-field">
+              <span>Min face size (ID)</span>
+              <input min="20" name="min_face_size_identity" onChange={updateField} type="number" value={form.min_face_size_identity} />
+            </label>
+            <label className="filter-field">
+              <span>Min face size (emotion)</span>
+              <input min="24" name="min_face_size_emotion" onChange={updateField} type="number" value={form.min_face_size_emotion} />
+            </label>
+            <label className="filter-field">
+              <span>Weak match threshold</span>
+              <input max="1" min="0" name="weak_match_threshold" onChange={updateField} step="0.01" type="number" value={form.weak_match_threshold} />
+            </label>
+            <label className="filter-field">
+              <span>Consensus frames</span>
+              <input min="2" name="consensus_frames_required" onChange={updateField} type="number" value={form.consensus_frames_required} />
             </label>
           </div>
 
@@ -433,8 +489,13 @@ export function CameraSettingsPage() {
                   <p><strong>Wing:</strong> {camera.wing || "-"}</p>
                   <p><strong>Room:</strong> {camera.room_number || "-"}</p>
                   <p><strong>Type:</strong> {(camera.type || "unknown").toUpperCase()}</p>
+                  <p><strong>Processing:</strong> {camera.processing_enabled === false ? "Disabled" : "Enabled"}</p>
                   <p><strong>Resolution:</strong> {camera.resolution || "-"}</p>
                   <p><strong>FPS:</strong> {camera.fps || "-"}</p>
+                  <p><strong>Min face ID:</strong> {camera.min_face_size_identity || "-"}</p>
+                  <p><strong>Min face emotion:</strong> {camera.min_face_size_emotion || "-"}</p>
+                  <p><strong>Weak threshold:</strong> {camera.weak_match_threshold ?? "-"}</p>
+                  <p><strong>Consensus frames:</strong> {camera.consensus_frames_required || "-"}</p>
                   <div className="camera-card-actions">
                     <button
                       className="link-action"
@@ -460,6 +521,13 @@ export function CameraSettingsPage() {
                             type="button"
                           >
                             {testingCameraId === camera.id ? "Testing..." : "Test connection"}
+                          </button>
+                          <button
+                            className="secondary-button table-button"
+                            onClick={() => handleToggleProcessing(camera)}
+                            type="button"
+                          >
+                            {camera.processing_enabled === false ? "Enable" : "Disable"}
                           </button>
                           <button
                             className="danger-button table-button"

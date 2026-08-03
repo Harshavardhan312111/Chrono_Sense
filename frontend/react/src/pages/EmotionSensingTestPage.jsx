@@ -8,18 +8,10 @@ import {
   startAllEmotionRecognition,
   stopAllEmotionRecognition,
 } from "../lib/admin";
+import { formatDateTimeInAppTimezone } from "../lib/time";
 
 function formatTimestamp(value) {
-  if (!value) {
-    return "No live data yet";
-  }
-
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return String(value);
-  }
-
-  return parsed.toLocaleString();
+  return formatDateTimeInAppTimezone(value, "No live data yet");
 }
 
 function getFaceEmotionState(face) {
@@ -183,7 +175,11 @@ export function EmotionSensingTestPage() {
         throw new Error("Select a camera first.");
       }
       await startEmotionRecognition(Number(selectedCameraId));
-      setStreamSrc(`/api/cameras/${selectedCameraId}/stream?ts=${Date.now()}`);
+      const previewParams = new URLSearchParams({
+        ts: String(Date.now()),
+        roi: "emotion",
+      });
+      setStreamSrc(`/api/cameras/${selectedCameraId}/stream?${previewParams.toString()}`);
       setCameraReady(true);
       setCameraOpen(true);
       setMessage(`Started recognition for ${selectedCamera?.name || "selected camera"}.`);

@@ -196,11 +196,22 @@ class EmotionAnalytics:
         if emotion:
             return emotion
         raw_emotion = row.get("raw_emotion")
-        if raw_emotion:
+        if raw_emotion and raw_emotion != "LowSignal":
             return raw_emotion
         fallback_emotion = row.get(fallback_key)
         if fallback_emotion and fallback_emotion != "LowSignal":
             return fallback_emotion
+        return None
+
+    @staticmethod
+    def _displayable_raw_emotion(row, fallback=None):
+        raw_emotion = row.get("raw_emotion")
+        if raw_emotion and raw_emotion != "LowSignal":
+            return raw_emotion
+        if fallback and fallback != "LowSignal":
+            return fallback
+        if row.get("raw_emotion") == "LowSignal" or fallback == "LowSignal":
+            return "Neutral"
         return None
 
     def _query_rows(self, start=None, end=None, profile_list=None, profile_id=None, location=None):
@@ -259,7 +270,7 @@ class EmotionAnalytics:
             previous_total = entry["total_detections"]
             entry["total_detections"] += 1
             emotion = self._measured_emotion(row, "smoothed_emotion")
-            raw_emotion = row.get("raw_emotion") or emotion
+            raw_emotion = self._displayable_raw_emotion(row, emotion)
             derived = row.get("derived_emotion")
             educational = row.get("educational_state")
             if emotion:
@@ -360,7 +371,7 @@ class EmotionAnalytics:
                 continue
             day = timestamp.strftime("%Y-%m-%d")
             emotion = self._measured_emotion(row, "smoothed_emotion")
-            raw_emotion = row.get("raw_emotion")
+            raw_emotion = self._displayable_raw_emotion(row)
             daily_trends.setdefault(day, {})
             daily_raw_trends.setdefault(day, {})
             if emotion:
@@ -442,7 +453,7 @@ class EmotionAnalytics:
             )
             previous_total = entry["total_detections"]
             emotion = self._measured_emotion(row, "smoothed_emotion")
-            raw_emotion = row.get("raw_emotion") or emotion
+            raw_emotion = self._displayable_raw_emotion(row, emotion)
             derived = row.get("derived_emotion")
             educational = row.get("educational_state")
             classroom_state = row.get("classroom_state")
@@ -496,7 +507,7 @@ class EmotionAnalytics:
                 if entry["emotions"]:
                     entry["dominant_emotion"] = max(entry["emotions"], key=entry["emotions"].get)
                 elif entry["usable_detections"] == 0:
-                    entry["dominant_emotion"] = "LowSignal"
+                    entry["dominant_emotion"] = "Neutral"
                 if entry["raw_emotions"]:
                     entry["dominant_raw_emotion"] = max(entry["raw_emotions"], key=entry["raw_emotions"].get)
                 if entry["derived_emotions"]:
@@ -554,7 +565,7 @@ class EmotionAnalytics:
         name = rows[0].get("name")
         for row in rows:
             emotion = self._measured_emotion(row, "smoothed_emotion")
-            raw_emotion = row.get("raw_emotion") or emotion
+            raw_emotion = self._displayable_raw_emotion(row, emotion)
             derived = row.get("derived_emotion")
             educational = row.get("educational_state")
             if emotion:

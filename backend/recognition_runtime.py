@@ -1,10 +1,13 @@
 import os
-from datetime import datetime
 
 try:
     from mongo_store import mongo_store
 except ImportError:
     from backend.mongo_store import mongo_store
+try:
+    from time_utils import app_now
+except ImportError:
+    from backend.time_utils import app_now
 
 
 CONTROL_COLLECTION = "recognition_runtime_control"
@@ -16,7 +19,7 @@ DEFAULT_WORKER_ID = os.getenv("CHRONOSENSE_RECOGNITION_WORKER_ID", "primary")
 
 
 def _utcnow():
-    return datetime.utcnow()
+    return app_now()
 
 
 def ensure_runtime_indexes():

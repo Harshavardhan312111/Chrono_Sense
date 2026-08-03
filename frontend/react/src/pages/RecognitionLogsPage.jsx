@@ -70,18 +70,20 @@ export function RecognitionLogsPage() {
                 <th>Subject</th>
                 <th>Location</th>
                 <th>Timestamp</th>
+                <th>Quality</th>
+                <th>Decision</th>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody>
               {loading ? (
                 <tr>
-                  <td className="table-empty" colSpan="4">Loading logs...</td>
+                  <td className="table-empty" colSpan="6">Loading logs...</td>
                 </tr>
               ) : null}
               {!loading && !logs.length ? (
                 <tr>
-                  <td className="table-empty" colSpan="4">No recognition logs available.</td>
+                  <td className="table-empty" colSpan="6">No recognition logs available.</td>
                 </tr>
               ) : null}
               {!loading ? logs.map((log, index) => (
@@ -89,6 +91,8 @@ export function RecognitionLogsPage() {
                   <td><strong>{getLogName(log)}</strong></td>
                   <td>{getLogLocation(log)}</td>
                   <td>{getLogTimestamp(log)}</td>
+                  <td>{log.quality_band || "-"}</td>
+                  <td>{log.decision_reason || "-"}</td>
                   <td>
                     <span className={`status-pill ${String(log.status || "").toLowerCase() === "unknown" ? "absent" : "present"}`}>
                       {log.status || log.event_type || "detected"}

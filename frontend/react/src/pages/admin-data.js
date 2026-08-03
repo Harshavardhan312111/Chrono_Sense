@@ -1,3 +1,9 @@
+import {
+  formatDateInAppTimezone,
+  getAppNow,
+  toDateInputValueInAppTimezone,
+} from "../lib/time";
+
 export const adminTabs = [
   { id: "dashboard", label: "DASHBOARD" },
   { id: "attendance", label: "TODAY'S ATTENDANCE" },
@@ -18,14 +24,14 @@ function formatLocalDateInputValue(date) {
 }
 
 export function getTodayDateInputValue() {
-  return formatLocalDateInputValue(new Date());
+  return toDateInputValueInAppTimezone();
 }
 
 export function getCurrentMonthInputValue() {
   return getTodayDateInputValue().slice(0, 7);
 }
 
-export function getWeekStartDateInputValue(date = new Date()) {
+export function getWeekStartDateInputValue(date = getAppNow()) {
   const weekDate = new Date(date);
   const day = weekDate.getDay();
   const diff = day === 0 ? -6 : 1 - day;
@@ -68,11 +74,7 @@ export function enumerateDatesBetween(startDate, endDate) {
 }
 
 export function formatDate(dateString) {
-  if (!dateString) {
-    return "-";
-  }
-
-  return new Date(dateString).toLocaleDateString();
+  return formatDateInAppTimezone(dateString);
 }
 
 export function formatDuration(durationMinutes) {

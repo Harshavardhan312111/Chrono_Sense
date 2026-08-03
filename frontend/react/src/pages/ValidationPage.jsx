@@ -12,18 +12,14 @@ import {
   startRecognition,
   stopRecognition
 } from "../lib/admin";
+import { formatTimeInAppTimezone } from "../lib/time";
 
 const PROFILES_PAGE_SIZE = 6;
 const UNKNOWN_PAGE_SIZE = 4;
 const SNAPSHOTS_PAGE_SIZE = 8;
 
 function formatTime(value) {
-  if (!value) {
-    return "-";
-  }
-
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
+  return formatTimeInAppTimezone(value);
 }
 
 export function ValidationPage() {
@@ -321,6 +317,10 @@ export function ValidationPage() {
                           <div>
                             <strong>{face.name}</strong>
                             <p>Profile ID: {face.profile_id}</p>
+                            <p>Quality: {face.quality_band || "-"}</p>
+                            <p>Identity decision: {face.identity_decision_reason || face.decision_reason || face.recognition_rejection_reason || "-"}</p>
+                            <p>Emotion status: {face.emotion_status_reason || face.emotion_unavailable_reason || "emotion_available"}</p>
+                            <p>Recovery: {face.recovery_stage || face.preprocess_variant || "-"}</p>
                           </div>
                           <span className="badge-light">{(confidence * 100).toFixed(1)}%</span>
                         </div>
@@ -405,6 +405,7 @@ export function ValidationPage() {
                       </div>
                       <p>First seen: {formatTime(face.first_seen)}</p>
                       <p>Last seen: {formatTime(face.last_seen)}</p>
+                      <p>Identity decision: {face.identity_decision_reason || face.decision_reason || "-"}</p>
                       <div className="section-actions">
                         <label className="filter-field validation-assign">
                           <span>Assign to profile</span>
